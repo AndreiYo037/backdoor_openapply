@@ -40,9 +40,15 @@ const Index = () => {
               </span>
             </div>
             <div className="flex items-center gap-1">
-              <NavLink to="/" icon={Search} label="Search" />
-              <NavLink to="/cv-optimize" icon={FileText} label="CV Optimize" />
-              <NavLink to="/mass-apply" icon={Rocket} label="Mass Apply" />
+              <NavLink to="/" end className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-all" activeClassName="bg-primary/15 text-primary border border-primary/30">
+                <Search className="w-4 h-4" /> Search
+              </NavLink>
+              <NavLink to="/cv-optimize" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-all" activeClassName="bg-primary/15 text-primary border border-primary/30">
+                <FileText className="w-4 h-4" /> CV Optimize
+              </NavLink>
+              <NavLink to="/mass-apply" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-all" activeClassName="bg-primary/15 text-primary border border-primary/30">
+                <Rocket className="w-4 h-4" /> Mass Apply
+              </NavLink>
             </div>
             <div className="flex items-center gap-2 text-sm">
               <span className="flex items-center gap-1 text-primary text-xs font-mono">
