@@ -1,7 +1,11 @@
-import { Users, UserCheck, CalendarDays } from "lucide-react";
+import { useState } from "react";
+import { Users, UserCheck, CalendarDays, Send } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
 import PersonCard, { Person } from "./PersonCard";
 import ProfileCompareCard, { ProfileData } from "./ProfileCompareCard";
 import EventCard, { EventData } from "./EventCard";
+import { toast } from "sonner";
 
 interface ResultsSectionProps {
   people: Person[];
@@ -10,70 +14,83 @@ interface ResultsSectionProps {
 }
 
 const ResultsSection = ({ people, profiles, events }: ResultsSectionProps) => {
+  const handleMassSend = (type: "people" | "profiles") => {
+    const count = type === "people" ? people.length : profiles.length;
+    toast.success(`Queued cold messages to ${count} ${type}`, {
+      description: "LinkedIn messages will be sent sequentially to avoid rate limits.",
+    });
+  };
+
   return (
-    <div className="w-full max-w-7xl mx-auto mt-12 space-y-10 animate-fade-in">
-      {/* Relevant People */}
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <div className="p-2 rounded-lg bg-primary/10 border border-primary/20">
-            <Users className="w-5 h-5 text-primary" />
-          </div>
-          <div>
-            <h2 className="text-lg font-bold text-foreground">Relevant People</h2>
-            <p className="text-xs text-muted-foreground">Key contacts at target companies</p>
-          </div>
-          <span className="ml-auto text-xs font-mono text-primary bg-primary/10 px-2 py-1 rounded-md">
-            {people.length} found
-          </span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {people.map((person) => (
-            <PersonCard key={person.id} person={person} />
-          ))}
-        </div>
-      </section>
+    <div className="w-full max-w-5xl mx-auto mt-8 animate-fade-in">
+      <Tabs defaultValue="people" className="w-full">
+        <TabsList className="w-full bg-card/60 backdrop-blur-xl border border-border/50 h-12 p-1 rounded-xl">
+          <TabsTrigger value="people" className="flex-1 gap-2 data-[state=active]:bg-primary/15 data-[state=active]:text-primary rounded-lg">
+            <Users className="w-4 h-4" />
+            People
+            <span className="text-xs font-mono bg-primary/10 px-1.5 py-0.5 rounded">{people.length}</span>
+          </TabsTrigger>
+          <TabsTrigger value="profiles" className="flex-1 gap-2 data-[state=active]:bg-primary/15 data-[state=active]:text-primary rounded-lg">
+            <UserCheck className="w-4 h-4" />
+            Profiles
+            <span className="text-xs font-mono bg-primary/10 px-1.5 py-0.5 rounded">{profiles.length}</span>
+          </TabsTrigger>
+          <TabsTrigger value="events" className="flex-1 gap-2 data-[state=active]:bg-primary/15 data-[state=active]:text-primary rounded-lg">
+            <CalendarDays className="w-4 h-4" />
+            Events
+            <span className="text-xs font-mono bg-primary/10 px-1.5 py-0.5 rounded">{events.length}</span>
+          </TabsTrigger>
+        </TabsList>
 
-      {/* Similar Profiles */}
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <div className="p-2 rounded-lg bg-accent/10 border border-accent/20">
-            <UserCheck className="w-5 h-5 text-accent" />
+        <TabsContent value="people">
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-sm text-muted-foreground">Key contacts at target companies</p>
+            <Button
+              size="sm"
+              onClick={() => handleMassSend("people")}
+              className="gap-1.5 bg-primary/15 text-primary border border-primary/30 hover:bg-primary/25"
+            >
+              <Send className="w-3.5 h-3.5" />
+              Message All ({people.length})
+            </Button>
           </div>
-          <div>
-            <h2 className="text-lg font-bold text-foreground">Similar Profiles</h2>
-            <p className="text-xs text-muted-foreground">People in the same or similar roles for CV comparison</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {people.map((person) => (
+              <PersonCard key={person.id} person={person} />
+            ))}
           </div>
-          <span className="ml-auto text-xs font-mono text-accent bg-accent/10 px-2 py-1 rounded-md">
-            {profiles.length} found
-          </span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {profiles.map((profile) => (
-            <ProfileCompareCard key={profile.id} profile={profile} />
-          ))}
-        </div>
-      </section>
+        </TabsContent>
 
-      {/* Nearby Events */}
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <div className="p-2 rounded-lg bg-violet-500/10 border border-violet-500/20">
-            <CalendarDays className="w-5 h-5 text-violet-400" />
+        <TabsContent value="profiles">
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-sm text-muted-foreground">People in similar roles for CV comparison</p>
+            <Button
+              size="sm"
+              onClick={() => handleMassSend("profiles")}
+              className="gap-1.5 bg-primary/15 text-primary border border-primary/30 hover:bg-primary/25"
+            >
+              <Send className="w-3.5 h-3.5" />
+              Message All ({profiles.length})
+            </Button>
           </div>
-          <div>
-            <h2 className="text-lg font-bold text-foreground">Nearby Events</h2>
-            <p className="text-xs text-muted-foreground">Organic networking opportunities</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {profiles.map((profile) => (
+              <ProfileCompareCard key={profile.id} profile={profile} />
+            ))}
           </div>
-          <span className="ml-auto text-xs font-mono text-violet-400 bg-violet-500/10 px-2 py-1 rounded-md">
-            {events.length} upcoming
-          </span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {events.map((event) => (
-            <EventCard key={event.id} event={event} />
-          ))}
-        </div>
-      </section>
+        </TabsContent>
+
+        <TabsContent value="events">
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-sm text-muted-foreground">Organic networking opportunities</p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {events.map((event) => (
+              <EventCard key={event.id} event={event} />
+            ))}
+          </div>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 };

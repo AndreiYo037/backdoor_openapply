@@ -1,4 +1,6 @@
-import { Briefcase, MapPin, GraduationCap, TrendingUp } from "lucide-react";
+import { Briefcase, MapPin, GraduationCap, Send } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
 
 export interface ProfileData {
   id: string;
@@ -17,6 +19,12 @@ const ProfileCompareCard = ({ profile }: { profile: ProfileData }) => {
     if (score >= 80) return "text-emerald-400 bg-emerald-400/10 border-emerald-400/20";
     if (score >= 60) return "text-amber-400 bg-amber-400/10 border-amber-400/20";
     return "text-red-400 bg-red-400/10 border-red-400/20";
+  };
+
+  const handleColdMessage = () => {
+    toast.success(`Cold message queued for ${profile.name}`, {
+      description: "Will be sent via LinkedIn automation.",
+    });
   };
 
   return (
@@ -60,6 +68,18 @@ const ProfileCompareCard = ({ profile }: { profile: ProfileData }) => {
         {profile.skills.length > 5 && (
           <span className="text-xs text-muted-foreground">+{profile.skills.length - 5}</span>
         )}
+      </div>
+
+      <div className="mt-3 pt-3 border-t border-border/50">
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={handleColdMessage}
+          className="h-7 px-2 text-xs gap-1 text-primary hover:bg-primary/15 hover:text-primary"
+        >
+          <Send className="w-3 h-3" />
+          Cold Message on LinkedIn
+        </Button>
       </div>
     </div>
   );
