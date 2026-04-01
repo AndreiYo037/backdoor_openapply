@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Rocket, ExternalLink, CheckCircle, Clock, Zap, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
+import TopNav from "@/components/TopNav";
 import { useNavigate } from "react-router-dom";
 
 interface JobListing {

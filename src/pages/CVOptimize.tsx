@@ -3,6 +3,7 @@ import { Upload, FileText, Sparkles, CheckCircle, AlertTriangle, Target } from "
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
+import TopNav from "@/components/TopNav";
 
 const CVOptimize = () => {
   const [file, setFile] = useState<File | null>(null);
