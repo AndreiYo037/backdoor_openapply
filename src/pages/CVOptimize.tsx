@@ -3,6 +3,7 @@ import { Upload, FileText, Sparkles, CheckCircle, AlertTriangle, Target } from "
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
+import TopNav from "@/components/TopNav";
 
 const CVOptimize = () => {
   const [file, setFile] = useState<File | null>(null);
@@ -47,8 +48,9 @@ const CVOptimize = () => {
   };
 
   return (
-    <div className="min-h-screen bg-background px-6 py-12">
-      <div className="max-w-4xl mx-auto">
+    <div className="min-h-screen bg-background">
+      <TopNav />
+      <div className="max-w-4xl mx-auto px-6 pb-12">
         <div className="text-center mb-10">
           <div className="inline-flex p-3 rounded-xl bg-primary/10 border border-primary/20 mb-4">
             <FileText className="w-8 h-8 text-primary" />
