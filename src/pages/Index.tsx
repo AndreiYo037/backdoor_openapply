@@ -2,8 +2,10 @@ import { useState } from "react";
 import { Network, Zap, Shield, Eye } from "lucide-react";
 import SearchBar from "@/components/SearchBar";
 import ResultsSection from "@/components/ResultsSection";
+import { NavLink } from "@/components/NavLink";
 import { mockPeople, mockProfiles, mockEvents } from "@/data/mockData";
 import heroBg from "@/assets/hero-bg.jpg";
+import { Search, FileText, Rocket } from "lucide-react";
 
 const Index = () => {
   const [hasResults, setHasResults] = useState(false);
@@ -11,7 +13,6 @@ const Index = () => {
 
   const handleSearch = (query: string, type: "search" | "url") => {
     setIsLoading(true);
-    // Simulate search delay
     setTimeout(() => {
       setIsLoading(false);
       setHasResults(true);
@@ -38,9 +39,18 @@ const Index = () => {
                 backdoor<span className="text-primary">network</span>
               </span>
             </div>
-            <div className="flex items-center gap-4 text-sm text-muted-foreground">
-              <span className="hidden sm:inline">Your unfair advantage in job hunting</span>
-              <div className="h-4 w-px bg-border" />
+            <div className="flex items-center gap-1">
+              <NavLink to="/" end className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-all" activeClassName="bg-primary/15 text-primary border border-primary/30">
+                <Search className="w-4 h-4" /> Search
+              </NavLink>
+              <NavLink to="/cv-optimize" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-all" activeClassName="bg-primary/15 text-primary border border-primary/30">
+                <FileText className="w-4 h-4" /> CV Optimize
+              </NavLink>
+              <NavLink to="/mass-apply" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-all" activeClassName="bg-primary/15 text-primary border border-primary/30">
+                <Rocket className="w-4 h-4" /> Mass Apply
+              </NavLink>
+            </div>
+            <div className="flex items-center gap-2 text-sm">
               <span className="flex items-center gap-1 text-primary text-xs font-mono">
                 <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse-glow" />
                 BETA
