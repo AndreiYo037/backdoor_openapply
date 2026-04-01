@@ -2,10 +2,9 @@ import { useState } from "react";
 import { Network, Zap, Shield, Eye } from "lucide-react";
 import SearchBar from "@/components/SearchBar";
 import ResultsSection from "@/components/ResultsSection";
-import { NavLink } from "@/components/NavLink";
+import TopNav from "@/components/TopNav";
 import { mockPeople, mockProfiles, mockEvents } from "@/data/mockData";
 import heroBg from "@/assets/hero-bg.jpg";
-import { Search, FileText, Rocket } from "lucide-react";
 
 const Index = () => {
   const [hasResults, setHasResults] = useState(false);
