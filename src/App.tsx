@@ -3,12 +3,15 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import Index from "./pages/Index.tsx";
-import CVOptimize from "./pages/CVOptimize.tsx";
-import MassApply from "./pages/MassApply.tsx";
+import Home from "./pages/Home.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+  defaultOptions: {
+    mutations: { retry: 0 },
+    queries: { retry: 0, staleTime: 7 * 24 * 60 * 60 * 1000 }, // 7 days — matches Apollo cache
+  },
+});
 
 const App = () => (
   <QueryClientProvider client={queryClient}>
@@ -17,10 +20,7 @@ const App = () => (
       <Sonner />
       <BrowserRouter>
         <Routes>
-          <Route path="/" element={<Index />} />
-          <Route path="/cv-optimize" element={<CVOptimize />} />
-          <Route path="/mass-apply" element={<MassApply />} />
-          {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+          <Route path="/" element={<Home />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>
