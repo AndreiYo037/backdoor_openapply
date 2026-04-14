@@ -22,6 +22,9 @@ from backend.storage.database import PersistentDatabase
 logger = logging.getLogger(__name__)
 FINAL_MIN_RESULTS = 3
 FINAL_MAX_RESULTS = 5
+PIPELINE_MAX_SECONDS = 45
+MAX_STAGE1_LINKEDIN_JOBS = 3
+STAGE2_TRIGGER_MAX_STAGE1_QUALIFIED = 0
 
 
 class UserRecord(BaseModel):
@@ -148,6 +151,7 @@ def build_router() -> APIRouter:
     ) -> dict[str, Any]:
         try:
             logger.info("[API] PipelineEntry -> Input: user_id=%s role=%s", user_id, target_role)
+            pipeline_start = time.perf_counter()
             state.internships.clear()
             state.contacts.clear()
             state.emails.clear()
@@ -175,49 +179,66 @@ def build_router() -> APIRouter:
                 state.internships[internship.id] = internship
                 database.upsert_internship(internship.model_dump(exclude={"role_match"}))
 
-            def qualify_jobs(rows: list[Internship]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+            def qualify_jobs(rows: list[Internship], max_jobs: int | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
                 qualified: list[dict[str, Any]] = []
                 debug_rows: list[dict[str, Any]] = []
                 linkedin_candidates = 0
+                processed = 0
                 for internship in rows:
+                    if time.perf_counter() - pipeline_start >= PIPELINE_MAX_SECONDS:
+                        logger.warning("[API] PipelineBudget -> Stage halted at %ss", PIPELINE_MAX_SECONDS)
+                        break
+                    if max_jobs is not None and processed >= max_jobs:
+                        break
                     if not _strict_job_filter(internship, target_role):
                         continue
                     logger.info("[Service] LinkedInSearch -> Input: company=%s role=%s", internship.company, internship.role)
                     contact, debug_row = linkedin.discover_job_contact(internship.company, internship.role or target_role)
                     linkedin_candidates += int(debug_row.get("candidates_found", 0))
                     debug_rows.append(debug_row)
+                    processed += 1
                     if not contact:
                         continue
                     quality_score = _internship_quality_score(internship, contact, target_role)
                     qualified.append(_format_job_output(internship, contact, quality_score))
                 return qualified, debug_rows, linkedin_candidates
 
-            qualified_stage1, per_job_debug, linkedin_candidates = qualify_jobs(ranked_stage1)
+            qualified_stage1, per_job_debug, linkedin_candidates = qualify_jobs(
+                ranked_stage1,
+                max_jobs=MAX_STAGE1_LINKEDIN_JOBS,
+            )
 
             if len(qualified_stage1) >= FINAL_MIN_RESULTS:
                 final_jobs = sorted(qualified_stage1, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
             else:
-                logger.info("[Service] CompanyCareersScraper -> Input: role=%s", target_role)
-                stage2_rows = careers_scraper.scrape(target_role, limit=20)
-                logger.info("[Service] CompanyCareersScraper -> Output: count=%s", len(stage2_rows))
-                stage2_internships = [
-                    Internship(
-                        id=f"career-{idx}",
-                        company=row.company,
-                        role=row.title,
-                        location=row.location,
-                        description=row.description,
-                        requirements=row.description,
-                        job_url=row.job_url,
-                        source="CareerPage",
-                    )
-                    for idx, row in enumerate(stage2_rows, start=1)
-                ]
-                qualified_stage2, debug_stage2, linkedin_candidates_stage2 = qualify_jobs(stage2_internships)
-                per_job_debug.extend(debug_stage2)
-                linkedin_candidates += linkedin_candidates_stage2
-                merged = qualified_stage1 + qualified_stage2
-                final_jobs = sorted(merged, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
+                should_run_stage2 = (
+                    len(qualified_stage1) <= STAGE2_TRIGGER_MAX_STAGE1_QUALIFIED
+                    and time.perf_counter() - pipeline_start < PIPELINE_MAX_SECONDS - 8
+                )
+                if should_run_stage2:
+                    logger.info("[Service] CompanyCareersScraper -> Input: role=%s", target_role)
+                    stage2_rows = careers_scraper.scrape(target_role, limit=20)
+                    logger.info("[Service] CompanyCareersScraper -> Output: count=%s", len(stage2_rows))
+                    stage2_internships = [
+                        Internship(
+                            id=f"career-{idx}",
+                            company=row.company,
+                            role=row.title,
+                            location=row.location,
+                            description=row.description,
+                            requirements=row.description,
+                            job_url=row.job_url,
+                            source="CareerPage",
+                        )
+                        for idx, row in enumerate(stage2_rows, start=1)
+                    ]
+                    qualified_stage2, debug_stage2, linkedin_candidates_stage2 = qualify_jobs(stage2_internships, max_jobs=2)
+                    per_job_debug.extend(debug_stage2)
+                    linkedin_candidates += linkedin_candidates_stage2
+                    merged = qualified_stage1 + qualified_stage2
+                    final_jobs = sorted(merged, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
+                else:
+                    final_jobs = sorted(qualified_stage1, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
 
             logger.info(
                 "[API] PipelineExit -> Output: %s",

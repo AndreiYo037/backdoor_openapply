@@ -126,7 +126,7 @@ class LinkedInSearchService:
     def _search_google(self, query: str) -> list[dict[str, str]]:
         if query in self._cache:
             return self._cache[query]
-        time.sleep(random.uniform(1.5, 3.5))
+        time.sleep(random.uniform(0.6, 1.2))
         try:
             response = requests.get(
                 GOOGLE_SEARCH_ENDPOINT,
