@@ -19,11 +19,16 @@ export default function Internships() {
               <p className="font-semibold">{item.role}</p>
               <p className="text-sm text-muted-foreground">{item.company}</p>
               <p className="text-sm">Match: {(item.role_match * 100).toFixed(1)}%</p>
+              <Link
+                to={`/contacts?company=${encodeURIComponent(item.company)}&role=${encodeURIComponent(item.role)}`}
+                className="inline-block mt-3 underline text-sm"
+              >
+                View top contacts
+              </Link>
             </div>
           ))}
         </div>
       )}
-      <Link to="/contacts" className="inline-block mt-6 underline">View top contacts</Link>
     </div>
   );
 }

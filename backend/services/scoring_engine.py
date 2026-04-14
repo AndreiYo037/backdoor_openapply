@@ -17,16 +17,19 @@ NEGATIVE_ROLE_TERMS = {"sales", "accountant", "legal", "operations", "finance", 
 
 
 def _seniority_value(seniority: str) -> float:
-    if seniority == "manager":
-        return 0.7
-    if seniority == "director":
-        return 0.55
-    return 0.85
+    normalized = (seniority or "").lower()
+    if "mid" in normalized or "individual" in normalized or "ic" in normalized:
+        return 1.0
+    if "manager" in normalized:
+        return 0.8
+    if "hr" in normalized or "recruit" in normalized or "talent" in normalized:
+        return 0.5
+    return 0.6
 
 
 def _reachability_score(contact: Contact, university: str) -> float:
     alumni = 1.0 if university and university.lower() in contact.education.lower() else 0.3
-    small_gap = 0.8 if contact.seniority in {"individual_contributor", "manager"} else 0.5
+    small_gap = 0.8 if contact.seniority in {"individual_contributor", "manager", "mid"} else 0.5
     role_l = contact.role.lower()
     similar_path = 0.8 if any(t in role_l for t in {"engineer", "product", "talent", "recruit"}) else 0.45
 
@@ -71,19 +74,30 @@ class ScoringEngine:
             lexical_overlap = len(role_tokens & contact_tokens) / max(len(role_tokens), 1)
             role_relevance = _role_relevance(role_query, contact.role)
             role_match = min((0.55 * lexical_overlap) + (0.45 * role_relevance), 1.0)
-            affinity = 1.0 if university and university.lower() in contact.education.lower() else 0.5
+            if university and university.lower() in contact.education.lower():
+                affinity = 1.0
+            elif any(term in contact.education.lower() for term in {"university", "college", "nus", "ntu"}):
+                affinity = 0.5
+            else:
+                affinity = 0.0
             seniority = _seniority_value(contact.seniority)
             activity = min(max(contact.activity, 0.0), 1.0)
             email = email_by_contact_id.get(contact.id)
-            email_confidence = email.confidence_score if email else 0.0
+            if not email:
+                email_confidence = 0.0
+            elif email.confidence_label == "HIGH":
+                email_confidence = 1.0
+            elif email.confidence_label == "MEDIUM":
+                email_confidence = 0.5
+            else:
+                email_confidence = 0.0
             reachability = _reachability_score(contact, university)
             final_score = min(
                 (0.35 * role_match)
                 + (0.25 * affinity)
                 + (0.20 * seniority)
                 + (0.10 * activity)
-                + (0.10 * email_confidence)
-                + (0.10 * reachability),
+                + (0.10 * email_confidence),
                 1.0,
             )
             scores.append(
@@ -106,10 +120,14 @@ class ScoringEngine:
         scores: list[ContactScore],
         email_by_contact_id: dict[str, EmailRecord],
         max_per_company: int = 5,
+        min_per_company: int = 3,
     ) -> list[tuple[Contact, ContactScore]]:
         score_index = {score.contact_id: score for score in scores}
         kept: list[tuple[Contact, ContactScore]] = []
         company_counter: dict[str, int] = {}
+        company_pool_sizes: dict[str, int] = {}
+        for contact in contacts:
+            company_pool_sizes[contact.company] = company_pool_sizes.get(contact.company, 0) + 1
 
         for contact in sorted(contacts, key=lambda c: score_index[c.id].final_score, reverse=True):
             score = score_index[contact.id]
@@ -119,8 +137,31 @@ class ScoringEngine:
             if score.role_match < 0.35 or score.activity < 0.35 or score.reachability_score < 0.40:
                 continue
             used = company_counter.get(contact.company, 0)
-            if used >= max(3, min(max_per_company, 5)):
+            allowed_max = min(max_per_company, 5)
+            if used >= allowed_max:
                 continue
             company_counter[contact.company] = used + 1
             kept.append((contact, score))
+
+        # Ensure each company keeps at least 3 when there are enough candidates.
+        if min_per_company > 0:
+            by_company: dict[str, list[tuple[Contact, ContactScore]]] = {}
+            for contact in contacts:
+                by_company.setdefault(contact.company, []).append((contact, score_index[contact.id]))
+
+            kept_keys = {(item[0].id, item[0].company) for item in kept}
+            for company, candidates in by_company.items():
+                target_min = min(min_per_company, company_pool_sizes.get(company, 0), max_per_company)
+                current = [item for item in kept if item[0].company == company]
+                if len(current) >= target_min:
+                    continue
+                for item in sorted(candidates, key=lambda row: row[1].final_score, reverse=True):
+                    key = (item[0].id, item[0].company)
+                    if key in kept_keys:
+                        continue
+                    kept.append(item)
+                    kept_keys.add(key)
+                    current.append(item)
+                    if len(current) >= target_min:
+                        break
         return kept

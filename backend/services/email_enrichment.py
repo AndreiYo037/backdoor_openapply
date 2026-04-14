@@ -74,40 +74,13 @@ class EmailEnrichmentService:
         internsg_email: str | None,
     ) -> EmailRecord | None:
         if internsg_email:
-            local_part, domain = _email_parts(internsg_email)
-            if domain and domain in PUBLIC_EMAIL_DOMAINS:
-                return EmailRecord(
-                    id=f"email-{contact.id}",
-                    contact_id=contact.id,
-                    email=internsg_email,
-                    confidence_score=0.40,
-                    confidence_label="LOW",
-                )
-
-            if _likely_personal_match(contact.name, internsg_email):
-                return EmailRecord(
-                    id=f"email-{contact.id}",
-                    contact_id=contact.id,
-                    email=internsg_email,
-                    confidence_score=0.92,
-                    confidence_label="HIGH",
-                )
-
-            if _is_generic_company_mailbox(local_part):
-                return EmailRecord(
-                    id=f"email-{contact.id}",
-                    contact_id=contact.id,
-                    email=internsg_email,
-                    confidence_score=0.58,
-                    confidence_label="MEDIUM",
-                )
-
+            # Per pipeline contract: InternSG-provided email is trusted as HIGH.
             return EmailRecord(
                 id=f"email-{contact.id}",
                 contact_id=contact.id,
                 email=internsg_email,
-                confidence_score=0.70,
-                confidence_label="MEDIUM",
+                confidence_score=1.0,
+                confidence_label="HIGH",
             )
 
         if contact.name.strip():
@@ -127,8 +100,9 @@ class EmailEnrichmentService:
                     id=f"email-{contact.id}",
                     contact_id=contact.id,
                     email=inferred,
-                    confidence_score=0.52,
+                    confidence_score=0.5,
                     confidence_label="MEDIUM",
                 )
 
+        # LOW-confidence fallbacks are discarded by returning None.
         return None

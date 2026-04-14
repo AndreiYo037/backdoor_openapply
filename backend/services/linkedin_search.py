@@ -294,13 +294,14 @@ class LinkedInSearchService:
         relevance = _role_alignment_score(inferred_role, snippet, role)
         years = 2 + int(relevance * 8)
         activity = min(0.45 + (0.5 * relevance), 0.95)
+        role_slug = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "role"
 
         seen_urls.add(url)
         candidates.append(
             (
                 relevance,
                 Contact(
-                    id=f"{company_slug}-{len(seen_urls)}",
+                    id=f"{company_slug}-{role_slug}-{len(seen_urls)}",
                     name=inferred_name,
                     role=inferred_role,
                     company=company,

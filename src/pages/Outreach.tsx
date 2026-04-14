@@ -25,11 +25,11 @@ export default function Outreach() {
       <h1 className="text-3xl font-bold mb-4">Outreach</h1>
       <div className="space-y-4">
         {result.contacts.map((item) => {
-          const draft = drafts[item.contact.id];
+          const draft = drafts[item.id];
           return (
-            <div key={item.contact.id} className="glass rounded p-4">
-              <p className="font-semibold">{item.contact.name}</p>
-              <button className="underline text-sm my-2" onClick={() => void handleGenerate(item.contact.id)}>
+            <div key={item.id} className="glass rounded p-4">
+              <p className="font-semibold">{item.name}</p>
+              <button className="underline text-sm my-2" onClick={() => void handleGenerate(item.id)}>
                 Generate messages
               </button>
               {draft && (
@@ -40,7 +40,7 @@ export default function Outreach() {
                     <button className="underline" onClick={() => navigator.clipboard.writeText(draft.email)}>Copy Email</button>
                     <button className="underline" onClick={() => navigator.clipboard.writeText(draft.linkedin)}>Copy LinkedIn</button>
                     <a className="underline" href="https://mail.google.com/mail/u/0/#drafts" target="_blank" rel="noreferrer">Open Gmail</a>
-                    <a className="underline" href={item.contact.linkedin_url} target="_blank" rel="noreferrer">Open LinkedIn</a>
+                    <a className="underline" href={item.linkedin_url} target="_blank" rel="noreferrer">Open LinkedIn</a>
                   </div>
                 </div>
               )}

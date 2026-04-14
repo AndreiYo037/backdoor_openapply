@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from backend.models.internship import Internship
 TINYFISH_ENDPOINT = "https://agent.tinyfish.ai/v1/automation/run-sse"
 INTERNSG_SEARCH_URL = "https://www.internsg.com/job/?f_p={query}"
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+MOCK_COMPANY_MARKERS = {"sample internsg company", "demo internsg employer", "sample company", "demo company"}
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,6 +44,8 @@ class InternSGScraper:
         rows = list(self._fetch_rows(role_query, limit=limit))
         internships: list[Internship] = []
         for idx, row in enumerate(rows, start=1):
+            if row.company.lower() in MOCK_COMPANY_MARKERS:
+                continue
             internships.append(
                 Internship(
                     id=f"internsg-{idx}",
@@ -51,6 +56,15 @@ class InternSGScraper:
                     application_email=row.application_email,
                     source="InternSG",
                 )
+            )
+        logger.info("InternSG scrape complete: query='%s' count=%s", role_query, len(internships))
+        if internships:
+            sample = internships[0]
+            logger.info(
+                "InternSG sample job: company='%s' role='%s' has_email=%s",
+                sample.company,
+                sample.role,
+                bool(sample.application_email),
             )
         return internships
 

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import logging
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.models.contact import Contact
@@ -18,6 +19,8 @@ from backend.services.outreach_tracker import OutreachTracker
 from backend.services.scoring_engine import ScoringEngine
 from backend.services.strategy_engine import StrategyEngine
 from backend.storage.database import PersistentDatabase
+
+logger = logging.getLogger(__name__)
 
 
 class UserRecord(BaseModel):
@@ -56,6 +59,7 @@ class AppState:
     contacts: dict[str, Contact]
     emails: dict[str, dict[str, Any]]
     contact_scores: dict[str, dict[str, Any]]
+    contact_results_by_key: dict[str, list[dict[str, Any]]]
 
 
 def build_router() -> APIRouter:
@@ -68,7 +72,53 @@ def build_router() -> APIRouter:
     strategy = StrategyEngine()
     message_generator = MessageGenerator()
     tracker = OutreachTracker(database)
-    state = AppState(users={}, internships={}, contacts={}, emails={}, contact_scores={})
+    state = AppState(
+        users={},
+        internships={},
+        contacts={},
+        emails={},
+        contact_scores={},
+        contact_results_by_key={},
+    )
+
+    def _result_key(company: str, role: str) -> str:
+        return f"{company.strip().lower()}||{role.strip().lower()}"
+
+    def _dedupe_contacts(contacts: list[Contact], company: str) -> list[Contact]:
+        unique: dict[tuple[str, str, str], Contact] = {}
+        for contact in contacts:
+            if contact.company.lower() != company.lower():
+                continue
+            unique_key = (contact.name.strip().lower(), contact.company.strip().lower(), contact.role.strip().lower())
+            if unique_key not in unique:
+                unique[unique_key] = contact
+        return list(unique.values())
+
+    def _format_contact_output(
+        contact: Contact,
+        score_row: Any,
+        email_row: Any,
+    ) -> dict[str, Any]:
+        reason = (
+            f"Role match {score_row.role_match:.2f}, affinity {score_row.affinity:.2f}, "
+            f"reachability {score_row.reachability_score:.2f}"
+        )
+        return {
+            "id": contact.id,
+            "name": contact.name,
+            "role": contact.role,
+            "company": contact.company,
+            "linkedin_url": contact.linkedin_url,
+            "email": email_row.email if email_row else None,
+            "email_confidence": email_row.confidence_label if email_row else "NONE",
+            "scores": {
+                "role_match": score_row.role_match,
+                "affinity": score_row.affinity,
+                "reachability": score_row.reachability_score,
+                "final": score_row.final_score,
+            },
+            "reason": reason,
+        }
 
     @router.post("/pipeline/run")
     async def run_pipeline(
@@ -79,6 +129,12 @@ def build_router() -> APIRouter:
         university: str = Form("National University of Singapore"),
         cv: UploadFile = File(...),
     ) -> dict[str, Any]:
+        state.internships.clear()
+        state.contacts.clear()
+        state.emails.clear()
+        state.contact_scores.clear()
+        state.contact_results_by_key.clear()
+
         pdf_bytes = await cv.read()
         cv_text = extract_cv_text(pdf_bytes)
         state.users[user_id] = UserRecord(
@@ -95,6 +151,7 @@ def build_router() -> APIRouter:
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         ranked_internships = score_internships(cv_text, internships)[:20]
+        logger.info("Pipeline internships ranked: count=%s", len(ranked_internships))
         for internship in ranked_internships:
             state.internships[internship.id] = internship
             database.upsert_internship(internship.model_dump(exclude={"role_match"}))
@@ -104,51 +161,67 @@ def build_router() -> APIRouter:
             if internship.company not in company_best_email and internship.application_email:
                 company_best_email[internship.company] = internship.application_email
 
-        all_contacts: list[Contact] = []
-        for internship in ranked_internships[:8]:
-            company_contacts = linkedin.discover_contacts(internship.company, target_role, limit=12)
-            all_contacts.extend(company_contacts)
+        contacts_out: list[dict[str, Any]] = []
+        unique_company_role_pairs = {
+            (internship.company, internship.role) for internship in ranked_internships[:10] if internship.company
+        }
 
-        for contact in all_contacts:
-            state.contacts[contact.id] = contact
-            database.upsert_contact(contact.model_dump(exclude={"experience", "activity"}))
-
-        email_by_contact_id: dict[str, Any] = {}
-        for contact in all_contacts:
-            email_record = email_service.enrich(contact, company_best_email.get(contact.company))
-            if email_record:
-                state.emails[email_record.id] = email_record.model_dump()
-                email_by_contact_id[contact.id] = email_record
-                database.upsert_email(
-                    {
-                        "id": email_record.id,
-                        "contact_id": email_record.contact_id,
-                        "email": email_record.email,
-                        "confidence_score": email_record.confidence_score,
-                    }
-                )
-
-        scored = scoring.score(all_contacts, target_role, university, email_by_contact_id)
-        filtered = scoring.apply_hard_filters(all_contacts, scored, email_by_contact_id, max_per_company=5)
-
-        contacts_out = []
-        for contact, score_row in filtered:
-            email_row = email_by_contact_id.get(contact.id)
-            strategy_plan = strategy.decide(contact, email_row)
-            state.contact_scores[contact.id] = score_row.model_dump()
-            database.upsert_contact_score(score_row.model_dump())
-            contacts_out.append(
-                {
-                    "contact": contact.model_dump(),
-                    "score": score_row.model_dump(),
-                    "email": email_row.model_dump() if email_row else None,
-                    "strategy": strategy_plan,
-                    "why_selected": (
-                        f"Role match {score_row.role_match:.2f}, affinity {score_row.affinity:.2f}, "
-                        f"reachability {score_row.reachability_score:.2f}"
-                    ),
-                }
+        for company, internship_role in sorted(unique_company_role_pairs):
+            discovered = linkedin.discover_contacts(company, internship_role or target_role, limit=18)
+            deduped_contacts = _dedupe_contacts(discovered, company)
+            logger.info(
+                "Contacts generated: company='%s' role='%s' discovered=%s deduped=%s",
+                company,
+                internship_role,
+                len(discovered),
+                len(deduped_contacts),
             )
+
+            email_by_contact_id: dict[str, Any] = {}
+            for contact in deduped_contacts:
+                state.contacts[contact.id] = contact
+                database.upsert_contact(contact.model_dump(exclude={"experience", "activity"}))
+                email_record = email_service.enrich(contact, company_best_email.get(company))
+                if email_record:
+                    state.emails[email_record.id] = email_record.model_dump()
+                    email_by_contact_id[contact.id] = email_record
+                    database.upsert_email(
+                        {
+                            "id": email_record.id,
+                            "contact_id": email_record.contact_id,
+                            "email": email_record.email,
+                            "confidence_score": email_record.confidence_score,
+                        }
+                    )
+
+            scored = scoring.score(deduped_contacts, internship_role or target_role, university, email_by_contact_id)
+            logger.info(
+                "Scoring distribution: company='%s' min=%.2f max=%.2f count=%s",
+                company,
+                min([row.final_score for row in scored], default=0.0),
+                max([row.final_score for row in scored], default=0.0),
+                len(scored),
+            )
+            filtered = scoring.apply_hard_filters(
+                deduped_contacts,
+                scored,
+                email_by_contact_id,
+                max_per_company=5,
+                min_per_company=3,
+            )
+            top_contacts = sorted(filtered, key=lambda row: row[1].final_score, reverse=True)[:5]
+            logger.info("Contacts filtered: company='%s' kept=%s", company, len(top_contacts))
+
+            key = _result_key(company, internship_role or target_role)
+            state.contact_results_by_key[key] = []
+            for contact, score_row in top_contacts:
+                email_row = email_by_contact_id.get(contact.id)
+                strategy.decide(contact, email_row)
+                state.contact_scores[contact.id] = score_row.model_dump()
+                database.upsert_contact_score(score_row.model_dump())
+                formatted = _format_contact_output(contact, score_row, email_row)
+                state.contact_results_by_key[key].append(formatted)
+                contacts_out.append(formatted)
 
         return {
             "user": state.users[user_id].model_dump(),
@@ -156,6 +229,15 @@ def build_router() -> APIRouter:
             "internships": [internship.model_dump() for internship in ranked_internships],
             "contacts": contacts_out,
         }
+
+    @router.get("/contacts")
+    def get_contacts(
+        company: str = Query(..., min_length=1),
+        role: str = Query(..., min_length=1),
+    ) -> dict[str, Any]:
+        key = _result_key(company, role)
+        contacts = state.contact_results_by_key.get(key, [])
+        return {"company": company, "role": role, "contacts": contacts}
 
     @router.post("/outreach/messages")
     def generate_messages(payload: MessageInput) -> dict[str, str]:

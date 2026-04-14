@@ -12,25 +12,20 @@ export type Internship = {
 };
 
 export type ContactResult = {
-  contact: {
-    id: string;
-    name: string;
-    role: string;
-    company: string;
-    linkedin_url: string;
-    education: string;
-    seniority: string;
-  };
-  score: {
-    final_score: number;
+  id: string;
+  name: string;
+  role: string;
+  company: string;
+  linkedin_url: string;
+  email: string | null;
+  email_confidence: string;
+  scores: {
+    final: number;
     role_match: number;
     affinity: number;
-    reachability_score: number;
-    email_confidence: number;
+    reachability: number;
   };
-  email: { email: string; confidence_label: string } | null;
-  strategy: string;
-  why_selected: string;
+  reason: string;
 };
 
 export type PipelineResponse = {
@@ -38,6 +33,12 @@ export type PipelineResponse = {
   internships: Internship[];
   contacts: ContactResult[];
   cv_text: string;
+};
+
+export type ContactsResponse = {
+  company: string;
+  role: string;
+  contacts: ContactResult[];
 };
 
 export async function runPipeline(input: {
@@ -70,4 +71,14 @@ export async function generateMessages(input: {
   });
   if (!response.ok) throw new Error("Message generation failed.");
   return (await response.json()) as { email: string; linkedin: string };
+}
+
+export async function getContactsByCompanyRole(input: {
+  company: string;
+  role: string;
+}): Promise<ContactsResponse> {
+  const query = new URLSearchParams({ company: input.company, role: input.role });
+  const response = await fetch(`${API_BASE}/api/contacts?${query.toString()}`);
+  if (!response.ok) throw new Error("Failed to load contacts.");
+  return (await response.json()) as ContactsResponse;
 }
