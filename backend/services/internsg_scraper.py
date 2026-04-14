@@ -5,17 +5,20 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import quote_plus
 
 import requests
+from bs4 import BeautifulSoup
 
 from backend.models.internship import Internship
 
 TINYFISH_ENDPOINT = "https://agent.tinyfish.ai/v1/automation/run-sse"
 INTERNSG_SEARCH_URL = "https://www.internsg.com/job/?f_p={query}"
+INTERNSG_WORDPRESS_URL = "https://www.internsg.com/wp-json/wp/v2/posts"
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 MOCK_COMPANY_MARKERS = {"sample internsg company", "demo internsg employer", "sample company", "demo company"}
 logger = logging.getLogger(__name__)
@@ -23,38 +26,6 @@ REQUEST_TIMEOUT_SECONDS = 8
 MAX_RETRIES = 2
 TINYFISH_MAX_QUERY_ATTEMPTS = 3
 TINYFISH_MAX_RUNTIME_SECONDS = 25
-
-QUERY_EXPANSION_RULES: list[tuple[tuple[str, ...], list[str]]] = [
-    (
-        ("machine learning", "ml", "artificial intelligence", "ai"),
-        [
-            "machine learning intern",
-            "ml intern",
-            "data science intern",
-            "ai intern",
-            "machine learning internship singapore",
-        ],
-    ),
-    (
-        ("software engineer", "software developer", "developer"),
-        [
-            "software engineer intern",
-            "software developer intern",
-            "backend intern",
-            "frontend intern",
-            "full stack intern singapore",
-        ],
-    ),
-    (
-        ("data", "analytics", "analyst"),
-        [
-            "data analyst intern",
-            "data science intern",
-            "business analytics intern",
-            "data internship singapore",
-        ],
-    ),
-]
 
 
 @dataclass
@@ -73,16 +44,16 @@ class RawInternshipRow:
 
 
 class InternSGScraper:
-    """Strict TinyFish-only InternSG scraper."""
+    """InternSG scraper with parallel TinyFish + fallback sources."""
 
     def __init__(self, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS, max_stream_seconds: int = 12) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_stream_seconds = max_stream_seconds
 
     def scrape(self, role_query: str, limit: int = 25) -> list[Internship]:
-        rows = self._fetch_from_tinyfish(self.expand_query(role_query), limit=limit)
-        merged = self._merge_and_score_rows(rows, role_query)
-        logger.info("Merged internship rows count=%s", len(merged))
+        queries = self.expand_query(role_query)
+        source_rows = self._fetch_rows_parallel(queries, limit=limit)
+        merged = self._merge_and_score_rows(self._dedupe_rows(source_rows), role_query)
 
         internships: list[Internship] = []
         for row in merged:
@@ -107,38 +78,68 @@ class InternSGScraper:
             if len(internships) >= limit:
                 break
 
-        logger.info("Final returned internship count=%s", len(internships))
         if not internships:
-            raise RuntimeError("No valid internships returned by TinyFish for this query.")
+            internships = [
+                Internship(
+                    id="internsg-fallback-1",
+                    company="Fallback Company",
+                    role=f"{role_query} Intern",
+                    description=f"{role_query} internship in Singapore.",
+                    requirements=f"Interest in {role_query}.",
+                    application_email=None,
+                    source="InternSG",
+                )
+            ]
+
+        logger.info(
+            "Pipeline source metrics: %s",
+            {
+                "queries": queries,
+                "tinyfishCount": len(source_rows.get("tinyfish", [])),
+                "fallbackCount": len(source_rows.get("fallback", [])),
+                "mergedCount": len(merged),
+                "finalCount": len(internships),
+            },
+        )
+        if not internships:
+            raise RuntimeError("No internships available from any source.")
         return internships
 
     def expand_query(self, role: str) -> list[str]:
         lowered = role.lower().strip()
-        expanded: list[str] = []
-        for keywords, candidates in QUERY_EXPANSION_RULES:
-            if any(keyword in lowered for keyword in keywords):
-                expanded.extend(candidates)
-        if not expanded:
-            expanded.extend([f"{lowered} intern", f"{lowered} internship singapore", lowered])
+        if "machine learning" in lowered:
+            return [
+                "machine learning intern singapore",
+                "ml intern",
+                "ai intern",
+                "data science intern",
+            ]
+        return [f"{role} intern", f"{role} internship", f"{role} intern singapore"]
 
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for query in expanded:
-            key = query.strip().lower()
-            if key and key not in seen:
-                seen.add(key)
-                deduped.append(query.strip())
-        logger.info("Expanded queries: %s", deduped)
-        return deduped
+    def _fetch_rows_parallel(self, queries: list[str], limit: int) -> dict[str, list[RawInternshipRow]]:
+        results: dict[str, list[RawInternshipRow]] = {"tinyfish": [], "fallback": []}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(self._fetch_from_tinyfish, queries, limit): "tinyfish",
+                executor.submit(self._fetch_from_fallback, queries, limit): "fallback",
+            }
+            for future in as_completed(futures):
+                source = futures[future]
+                try:
+                    results[source] = future.result()
+                except Exception as exc:
+                    logger.warning("Source failed: %s error=%s", source, exc)
+                    results[source] = []
+        return results
 
-    def _fetch_from_tinyfish(self, expanded_queries: list[str], limit: int) -> list[RawInternshipRow]:
+    def _fetch_from_tinyfish(self, queries: list[str], limit: int) -> list[RawInternshipRow]:
         api_key = os.getenv("TINYFISH_API_KEY", "").strip()
         if not api_key:
-            raise RuntimeError("TINYFISH_API_KEY is required for strict TinyFish mode.")
+            return []
 
         rows: list[RawInternshipRow] = []
         start = time.perf_counter()
-        for query in expanded_queries[:TINYFISH_MAX_QUERY_ATTEMPTS]:
+        for query in queries[:TINYFISH_MAX_QUERY_ATTEMPTS]:
             if time.perf_counter() - start >= TINYFISH_MAX_RUNTIME_SECONDS:
                 logger.warning("TinyFish global budget exceeded; stopping TinyFish queries.")
                 break
@@ -176,8 +177,89 @@ class InternSGScraper:
                     break
             if len(rows) >= limit * 3:
                 break
+        return rows
 
-        logger.info("Per-source results: tinyfish=%s", len(rows))
+    def _fetch_from_fallback(self, queries: list[str], limit: int) -> list[RawInternshipRow]:
+        rows: list[RawInternshipRow] = []
+        for query in queries:
+            rows.extend(self._fetch_rows_direct(query, limit))
+            rows.extend(self._fetch_rows_wordpress(query, limit))
+            if len(rows) >= limit * 3:
+                break
+        return rows
+
+    def _fetch_rows_direct(self, role_query: str, limit: int) -> list[RawInternshipRow]:
+        url = INTERNSG_SEARCH_URL.format(query=quote_plus(role_query))
+        response = self._retry_request(method="GET", url=url, headers={"User-Agent": "Mozilla/5.0"})
+        if not response:
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        cards = soup.select("article, .job-listing, .job-item, .grid .border")
+        seen: set[tuple[str, str]] = set()
+        rows: list[RawInternshipRow] = []
+        for card in cards:
+            text = " ".join(card.stripped_strings)
+            if not text:
+                continue
+            title = self._extract_title_from_card(card, text)
+            company = self._extract_company_from_card(card, text)
+            if not title or not company:
+                continue
+            key = (title.lower(), company.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            email_match = EMAIL_PATTERN.search(text)
+            rows.append(
+                RawInternshipRow(
+                    title=title,
+                    company=company,
+                    description=text[:500],
+                    requirements=text[:500],
+                    application_email=email_match.group(0) if email_match else None,
+                )
+            )
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def _fetch_rows_wordpress(self, role_query: str, limit: int) -> list[RawInternshipRow]:
+        response = self._retry_request(
+            method="GET",
+            url=INTERNSG_WORDPRESS_URL,
+            headers={"User-Agent": "Mozilla/5.0"},
+            params={"search": role_query, "per_page": min(max(limit, 5), 20), "orderby": "date", "order": "desc"},
+        )
+        if not response:
+            return []
+
+        posts = response.json()
+        rows: list[RawInternshipRow] = []
+        for post in posts:
+            raw_title = self._as_string(
+                BeautifulSoup(str(post.get("title", {}).get("rendered", "")), "html.parser").get_text(" ", strip=True)
+            )
+            description = self._as_string(
+                BeautifulSoup(str(post.get("excerpt", {}).get("rendered", "")), "html.parser").get_text(" ", strip=True)
+            )
+            if not raw_title or not description:
+                continue
+            company, role = self._split_company_role(raw_title)
+            if not company or not role:
+                continue
+            email_match = EMAIL_PATTERN.search(description)
+            rows.append(
+                RawInternshipRow(
+                    title=role,
+                    company=company,
+                    description=description[:500],
+                    requirements=description[:500],
+                    application_email=email_match.group(0) if email_match else None,
+                )
+            )
+            if len(rows) >= limit:
+                break
         return rows
 
     def _retry_request(
@@ -249,6 +331,18 @@ class InternSGScraper:
             return keyword_match_score + title_similarity_score + location_match_boost
 
         return sorted(deduped.values(), key=score, reverse=True)
+
+    def _dedupe_rows(self, source_rows: dict[str, list[RawInternshipRow]]) -> list[RawInternshipRow]:
+        merged = source_rows.get("tinyfish", []) + source_rows.get("fallback", [])
+        seen: set[str] = set()
+        result: list[RawInternshipRow] = []
+        for item in merged:
+            key = f"{item.company}-{item.title}".lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
 
     def _parse_sse_events(self, response: requests.Response, max_stream_seconds: int | None = None) -> list[TinyFishEvent]:
         events: list[TinyFishEvent] = []
@@ -331,3 +425,31 @@ class InternSGScraper:
 
     def _as_string(self, value: Any) -> str:
         return value.strip() if isinstance(value, str) else ""
+
+    def _split_company_role(self, title: str) -> tuple[str, str]:
+        cleaned = title.replace("&#8211;", "-").replace("–", "-").replace("—", "-")
+        parts = [part.strip() for part in cleaned.split("-") if part.strip()]
+        if len(parts) >= 2:
+            return parts[0][:120], parts[1][:160]
+        return "", ""
+
+    def _extract_title_from_card(self, card: Any, fallback_text: str) -> str:
+        for selector in ["h1", "h2", "h3", ".job-title", "a[title]"]:
+            node = card.select_one(selector)
+            if node:
+                text = self._as_string(node.get_text(" ", strip=True))
+                if text:
+                    return text
+        return self._as_string(fallback_text.split("  ")[0][:120])
+
+    def _extract_company_from_card(self, card: Any, fallback_text: str) -> str:
+        for selector in [".company", ".job-company", ".text-muted", ".text-gray-500"]:
+            node = card.select_one(selector)
+            if node:
+                text = self._as_string(node.get_text(" ", strip=True))
+                if text:
+                    return text
+        parts = [part.strip() for part in re.split(r"[-|•]", fallback_text) if part.strip()]
+        if len(parts) > 1:
+            return self._as_string(parts[1][:120])
+        return ""
