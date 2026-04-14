@@ -48,15 +48,30 @@ export async function runPipeline(input: {
   userEmail: string;
   university: string;
 }): Promise<PipelineResponse> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
   const form = new FormData();
   form.append("target_role", input.targetRole);
   form.append("user_name", input.userName);
   form.append("user_email", input.userEmail);
   form.append("university", input.university);
   form.append("cv", input.cvFile);
-  const response = await fetch(`${API_BASE}/api/pipeline/run`, { method: "POST", body: form });
-  if (!response.ok) throw new Error("Pipeline failed.");
-  return (await response.json()) as PipelineResponse;
+  try {
+    const response = await fetch(`${API_BASE}/api/pipeline/run`, {
+      method: "POST",
+      body: form,
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error("Pipeline failed.");
+    return (await response.json()) as PipelineResponse;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("Pipeline timed out. Please try a broader role or retry.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function generateMessages(input: {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -21,6 +22,8 @@ from backend.services.strategy_engine import StrategyEngine
 from backend.storage.database import PersistentDatabase
 
 logger = logging.getLogger(__name__)
+TARGET_CONTACTS_PER_COMPANY = 5
+MIN_CONTACTS_PER_COMPANY = 3
 
 
 class UserRecord(BaseModel):
@@ -147,7 +150,10 @@ def build_router() -> APIRouter:
         database.upsert_user(state.users[user_id].model_dump())
 
         try:
+            logger.info("Pipeline start: user_id=%s role='%s'", user_id, target_role)
+            scrape_start = time.perf_counter()
             internships = scraper.scrape(target_role, limit=30)
+            logger.info("InternSG scrape duration=%.2fs", time.perf_counter() - scrape_start)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         ranked_internships = score_internships(cv_text, internships)[:20]
@@ -163,12 +169,17 @@ def build_router() -> APIRouter:
 
         contacts_out: list[dict[str, Any]] = []
         unique_company_role_pairs = {
-            (internship.company, internship.role) for internship in ranked_internships[:10] if internship.company
+            (internship.company, internship.role) for internship in ranked_internships[:4] if internship.company
         }
 
         for company, internship_role in sorted(unique_company_role_pairs):
-            discovered = linkedin.discover_contacts(company, internship_role or target_role, limit=18)
-            deduped_contacts = _dedupe_contacts(discovered, company)
+            company_start = time.perf_counter()
+            discovered = linkedin.discover_contacts(
+                company,
+                internship_role or target_role,
+                limit=TARGET_CONTACTS_PER_COMPANY,
+            )
+            deduped_contacts = _dedupe_contacts(discovered, company)[:TARGET_CONTACTS_PER_COMPANY]
             logger.info(
                 "Contacts generated: company='%s' role='%s' discovered=%s deduped=%s",
                 company,
@@ -206,11 +217,18 @@ def build_router() -> APIRouter:
                 deduped_contacts,
                 scored,
                 email_by_contact_id,
-                max_per_company=5,
-                min_per_company=3,
+                max_per_company=TARGET_CONTACTS_PER_COMPANY,
+                min_per_company=MIN_CONTACTS_PER_COMPANY,
             )
-            top_contacts = sorted(filtered, key=lambda row: row[1].final_score, reverse=True)[:5]
-            logger.info("Contacts filtered: company='%s' kept=%s", company, len(top_contacts))
+            top_contacts = sorted(filtered, key=lambda row: row[1].final_score, reverse=True)[
+                :TARGET_CONTACTS_PER_COMPANY
+            ]
+            logger.info(
+                "Contacts filtered: company='%s' kept=%s duration=%.2fs",
+                company,
+                len(top_contacts),
+                time.perf_counter() - company_start,
+            )
 
             key = _result_key(company, internship_role or target_role)
             state.contact_results_by_key[key] = []

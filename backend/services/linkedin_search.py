@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from urllib.parse import quote_plus, unquote, urlparse
 
 import requests
@@ -98,15 +99,16 @@ def _role_alignment_score(role: str, snippet: str, requested_role: str) -> float
 class LinkedInSearchService:
     """Discover likely LinkedIn profiles from public web search results."""
 
-    def __init__(self, timeout_seconds: int = 12) -> None:
+    def __init__(self, timeout_seconds: int = 2, max_runtime_seconds: int = 3) -> None:
         self.timeout_seconds = timeout_seconds
+        self.max_runtime_seconds = max_runtime_seconds
 
     def discover_contacts(self, company: str, role: str, limit: int = 12) -> list[Contact]:
+        start = time.perf_counter()
         safe_limit = max(1, min(limit, 20))
         queries = [
             f'site:linkedin.com/in "{company}" "{role}" recruiter',
             f'site:linkedin.com/in "{company}" "{role}" "hiring manager"',
-            f'site:linkedin.com/in "{company}" "talent acquisition"',
         ]
 
         seen_urls: set[str] = set()
@@ -114,26 +116,41 @@ class LinkedInSearchService:
         company_slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-") or "company"
 
         for query in queries:
-            for result in self._search_duckduckgo(query):
+            if time.perf_counter() - start >= self.max_runtime_seconds:
+                break
+            remaining = max(self.max_runtime_seconds - (time.perf_counter() - start), 0.5)
+            timeout = min(self.timeout_seconds, remaining)
+            for result in self._search_duckduckgo(query, timeout):
                 if self._try_add_candidate(result, company, role, company_slug, seen_urls, candidates):
                     if len(candidates) >= safe_limit * 2:
                         break
             if len(candidates) >= safe_limit * 2:
                 break
 
-            for result in self._search_bing(query):
+            if time.perf_counter() - start >= self.max_runtime_seconds:
+                break
+            remaining = max(self.max_runtime_seconds - (time.perf_counter() - start), 0.5)
+            timeout = min(self.timeout_seconds, remaining)
+            for result in self._search_bing(query, timeout):
                 if self._try_add_candidate(result, company, role, company_slug, seen_urls, candidates):
                     if len(candidates) >= safe_limit * 2:
                         break
             if len(candidates) >= safe_limit * 2:
                 break
 
-            for result in self._search_tinyfish(company, role, query):
-                if self._try_add_candidate(result, company, role, company_slug, seen_urls, candidates):
-                    if len(candidates) >= safe_limit * 2:
-                        break
-            if len(candidates) >= safe_limit * 2:
-                break
+        if not candidates:
+            # Only try TinyFish fallback when direct search results are empty.
+            for query in queries:
+                if time.perf_counter() - start >= self.max_runtime_seconds:
+                    break
+                remaining = max(self.max_runtime_seconds - (time.perf_counter() - start), 0.5)
+                timeout = min(self.timeout_seconds, remaining)
+                for result in self._search_tinyfish(company, role, query, timeout):
+                    if self._try_add_candidate(result, company, role, company_slug, seen_urls, candidates):
+                        if len(candidates) >= safe_limit * 2:
+                            break
+                if len(candidates) >= safe_limit * 2:
+                    break
 
         if not candidates:
             # Return an empty list instead of made-up profile URLs.
@@ -142,12 +159,12 @@ class LinkedInSearchService:
         ranked = sorted(candidates, key=lambda row: row[0], reverse=True)
         return [contact for _, contact in ranked[:safe_limit]]
 
-    def _search_duckduckgo(self, query: str) -> list[dict[str, str]]:
+    def _search_duckduckgo(self, query: str, timeout_seconds: float) -> list[dict[str, str]]:
         try:
             response = requests.get(
                 DUCKDUCKGO_HTML_ENDPOINT,
                 params={"q": query},
-                timeout=self.timeout_seconds,
+                timeout=timeout_seconds,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             response.raise_for_status()
@@ -165,12 +182,12 @@ class LinkedInSearchService:
         except Exception:
             return []
 
-    def _search_bing(self, query: str) -> list[dict[str, str]]:
+    def _search_bing(self, query: str, timeout_seconds: float) -> list[dict[str, str]]:
         try:
             response = requests.get(
                 BING_SEARCH_ENDPOINT,
                 params={"q": query},
-                timeout=self.timeout_seconds,
+                timeout=timeout_seconds,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             response.raise_for_status()
@@ -188,7 +205,9 @@ class LinkedInSearchService:
         except Exception:
             return []
 
-    def _search_tinyfish(self, company: str, role: str, query: str) -> list[dict[str, str]]:
+    def _search_tinyfish(
+        self, company: str, role: str, query: str, timeout_seconds: float
+    ) -> list[dict[str, str]]:
         api_key = os.getenv("TINYFISH_API_KEY", "").strip()
         if not api_key:
             return []
@@ -206,7 +225,7 @@ class LinkedInSearchService:
                     "browser_profile": "stealth",
                     "api_integration": "openapply",
                 },
-                timeout=self.timeout_seconds * 2,
+                timeout=max(timeout_seconds, 0.5),
                 stream=True,
             )
             response.raise_for_status()
