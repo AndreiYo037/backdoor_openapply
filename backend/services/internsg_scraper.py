@@ -78,19 +78,6 @@ class InternSGScraper:
             if len(internships) >= limit:
                 break
 
-        if not internships:
-            internships = [
-                Internship(
-                    id="internsg-fallback-1",
-                    company="Fallback Company",
-                    role=f"{role_query} Intern",
-                    description=f"{role_query} internship in Singapore.",
-                    requirements=f"Interest in {role_query}.",
-                    application_email=None,
-                    source="InternSG",
-                )
-            ]
-
         logger.info(
             "Pipeline source metrics: %s",
             {
@@ -102,7 +89,7 @@ class InternSGScraper:
             },
         )
         if not internships:
-            raise RuntimeError("No internships available from any source.")
+            raise RuntimeError("No high-quality internships found from available sources.")
         return internships
 
     def expand_query(self, role: str) -> list[str]:
@@ -110,11 +97,18 @@ class InternSGScraper:
         if "machine learning" in lowered:
             return [
                 "machine learning intern singapore",
-                "ml intern",
-                "ai intern",
-                "data science intern",
+                "ml intern singapore",
+                "ai intern singapore",
+                "data science intern singapore",
+                "machine learning internship singapore",
+                "ai machine learning intern singapore",
             ]
-        return [f"{role} intern", f"{role} internship", f"{role} intern singapore"]
+        return [
+            f"{role} intern singapore",
+            f"{role} internship singapore",
+            f"{role} intern",
+            f"{role} internship",
+        ]
 
     def _fetch_rows_parallel(self, queries: list[str], limit: int) -> dict[str, list[RawInternshipRow]]:
         results: dict[str, list[RawInternshipRow]] = {"tinyfish": [], "fallback": []}
@@ -330,7 +324,8 @@ class InternSGScraper:
             location_match_boost = 0.2 if "singapore" in haystack else 0.0
             return keyword_match_score + title_similarity_score + location_match_boost
 
-        return sorted(deduped.values(), key=score, reverse=True)
+        ranked = sorted(deduped.values(), key=score, reverse=True)
+        return [row for row in ranked if self._is_strict_internship_row(row, role_query)]
 
     def _dedupe_rows(self, source_rows: dict[str, list[RawInternshipRow]]) -> list[RawInternshipRow]:
         merged = source_rows.get("tinyfish", []) + source_rows.get("fallback", [])
@@ -343,6 +338,22 @@ class InternSGScraper:
             seen.add(key)
             result.append(item)
         return result
+
+    def _is_strict_internship_row(self, row: RawInternshipRow, role_query: str) -> bool:
+        title = row.title.strip().lower()
+        if not row.company.strip() or not title:
+            return False
+        if "intern" not in title and "internship" not in title:
+            return False
+        if len(row.description.strip()) < 60:
+            return False
+        role_tokens = {
+            token for token in re.findall(r"[a-zA-Z]+", role_query.lower()) if token not in {"intern", "internship"}
+        }
+        haystack = f"{row.title} {row.description} {row.requirements}".lower()
+        if role_tokens and not any(token in haystack for token in role_tokens):
+            return False
+        return True
 
     def _parse_sse_events(self, response: requests.Response, max_stream_seconds: int | None = None) -> list[TinyFishEvent]:
         events: list[TinyFishEvent] = []

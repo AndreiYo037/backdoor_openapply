@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
-from urllib.parse import quote_plus, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -13,7 +12,6 @@ from backend.models.contact import Contact
 
 DUCKDUCKGO_HTML_ENDPOINT = "https://duckduckgo.com/html/"
 BING_SEARCH_ENDPOINT = "https://www.bing.com/search"
-TINYFISH_ENDPOINT = "https://agent.tinyfish.ai/v1/automation/run-sse"
 LINKEDIN_PROFILE_PATTERN = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#]+", re.I)
 ROLE_HINT_KEYWORDS = {
     "recruiter": {"recruit", "talent", "hiring", "sourcing", "acquisition"},
@@ -107,8 +105,10 @@ class LinkedInSearchService:
         start = time.perf_counter()
         safe_limit = max(1, min(limit, 20))
         queries = [
-            f'site:linkedin.com/in "{company}" "{role}" recruiter',
-            f'site:linkedin.com/in "{company}" "{role}" "hiring manager"',
+            f'"{company}" recruiter linkedin',
+            f'"{company}" talent acquisition linkedin',
+            f'"{company}" machine learning linkedin',
+            f'"{company}" data science linkedin',
         ]
 
         seen_urls: set[str] = set()
@@ -137,20 +137,6 @@ class LinkedInSearchService:
                         break
             if len(candidates) >= safe_limit * 2:
                 break
-
-        if not candidates:
-            # Only try TinyFish fallback when direct search results are empty.
-            for query in queries:
-                if time.perf_counter() - start >= self.max_runtime_seconds:
-                    break
-                remaining = max(self.max_runtime_seconds - (time.perf_counter() - start), 0.5)
-                timeout = min(self.timeout_seconds, remaining)
-                for result in self._search_tinyfish(company, role, query, timeout):
-                    if self._try_add_candidate(result, company, role, company_slug, seen_urls, candidates):
-                        if len(candidates) >= safe_limit * 2:
-                            break
-                if len(candidates) >= safe_limit * 2:
-                    break
 
         if not candidates:
             # Return an empty list instead of made-up profile URLs.
@@ -205,91 +191,6 @@ class LinkedInSearchService:
         except Exception:
             return []
 
-    def _search_tinyfish(
-        self, company: str, role: str, query: str, timeout_seconds: float
-    ) -> list[dict[str, str]]:
-        api_key = os.getenv("TINYFISH_API_KEY", "").strip()
-        if not api_key:
-            return []
-        try:
-            url = f"{BING_SEARCH_ENDPOINT}?q={quote_plus(query)}"
-            response = requests.post(
-                TINYFISH_ENDPOINT,
-                headers={"Content-Type": "application/json", "X-API-Key": api_key},
-                json={
-                    "url": url,
-                    "goal": (
-                        f"Collect up to 10 public LinkedIn people profile results for {company} and {role}. "
-                        "Return a JSON array with objects containing title, snippet, and linkedin_url."
-                    ),
-                    "browser_profile": "stealth",
-                    "api_integration": "openapply",
-                },
-                timeout=max(timeout_seconds, 0.5),
-                stream=True,
-            )
-            response.raise_for_status()
-            rows = self._extract_tinyfish_rows(response)
-            normalized: list[dict[str, str]] = []
-            for row in rows:
-                normalized.append(
-                    {
-                        "href": str(row.get("linkedin_url") or row.get("url") or ""),
-                        "title": str(row.get("title") or row.get("name") or ""),
-                        "snippet": str(row.get("snippet") or row.get("description") or ""),
-                    }
-                )
-            return normalized
-        except Exception:
-            return []
-
-    def _extract_tinyfish_rows(self, response: requests.Response) -> list[dict[str, object]]:
-        data_lines: list[str] = []
-        payloads: list[object] = []
-        for line in response.iter_lines(decode_unicode=True):
-            clean = (line or "").strip()
-            if not clean:
-                if data_lines:
-                    joined = "\n".join(data_lines).strip()
-                    parsed = self._parse_json(joined)
-                    payloads.append(parsed)
-                data_lines = []
-                continue
-            if clean.startswith("data:"):
-                data_lines.append(clean.split(":", 1)[1].strip())
-        if data_lines:
-            payloads.append(self._parse_json("\n".join(data_lines).strip()))
-
-        rows: list[dict[str, object]] = []
-        for payload in payloads:
-            rows.extend(self._walk_for_rows(payload))
-        return rows
-
-    def _walk_for_rows(self, value: object) -> list[dict[str, object]]:
-        if isinstance(value, str):
-            parsed = self._parse_json(value)
-            return self._walk_for_rows(parsed) if parsed != value else []
-        if isinstance(value, list):
-            collected: list[dict[str, object]] = []
-            for item in value:
-                collected.extend(self._walk_for_rows(item))
-            return collected
-        if isinstance(value, dict):
-            lower_keys = {str(key).lower() for key in value.keys()}
-            if "linkedin_url" in lower_keys or ("url" in lower_keys and "title" in lower_keys):
-                return [value]
-            collected: list[dict[str, object]] = []
-            for nested in value.values():
-                collected.extend(self._walk_for_rows(nested))
-            return collected
-        return []
-
-    def _parse_json(self, raw: str) -> object:
-        try:
-            return json.loads(raw)
-        except Exception:
-            return raw
-
     def _try_add_candidate(
         self,
         result_row: dict[str, str],
@@ -302,10 +203,25 @@ class LinkedInSearchService:
         url = _extract_clean_linkedin_url(result_row.get("href", ""))
         if not url or url in seen_urls:
             return False
+        lowered_url = url.lower()
+        if any(token in lowered_url for token in ("/company/", "/jobs/", "/authwall", "linkedin.com/signup")):
+            return False
 
         title_text = result_row.get("title", "")
         snippet = result_row.get("snippet", "")
         if company.lower() not in f"{title_text} {snippet}".lower():
+            return False
+        relevance_text = f"{title_text} {snippet}".lower()
+        relevant_markers = {
+            "recruiter",
+            "talent acquisition",
+            "hiring",
+            "machine learning",
+            "data science",
+            "ai",
+            "engineer",
+        }
+        if not any(marker in relevance_text for marker in relevant_markers):
             return False
 
         inferred_name = _extract_name_from_title(title_text, url)

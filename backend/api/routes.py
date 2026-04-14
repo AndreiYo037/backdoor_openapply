@@ -24,6 +24,8 @@ from backend.storage.database import PersistentDatabase
 logger = logging.getLogger(__name__)
 TARGET_CONTACTS_PER_COMPANY = 5
 MIN_CONTACTS_PER_COMPANY = 3
+FINAL_MIN_RESULTS = 3
+FINAL_MAX_RESULTS = 5
 
 
 class UserRecord(BaseModel):
@@ -123,6 +125,27 @@ def build_router() -> APIRouter:
             "reason": reason,
         }
 
+    def _internship_quality_score(internship: Internship, contact: Contact) -> int:
+        score = 0
+        title = internship.role.lower()
+        body = f"{internship.role} {internship.description} {internship.requirements}".lower()
+        contact_role = contact.role.lower()
+        if "intern" in title:
+            score += 5
+        if any(token in body for token in {"machine learning", "ml", "ai", "data science"}):
+            score += 5
+        if "singapore" in body:
+            score += 3
+        if any(token in contact_role for token in {"recruiter", "talent acquisition", "hiring"}):
+            score += 5
+        elif any(token in contact_role for token in {"engineer", "data scientist", "machine learning"}):
+            score += 4
+        else:
+            score += 2
+        if "." in contact.linkedin_url:
+            score += 2
+        return score
+
     @router.post("/pipeline/run")
     async def run_pipeline(
         target_role: str = Form(...),
@@ -168,84 +191,76 @@ def build_router() -> APIRouter:
                 company_best_email[internship.company] = internship.application_email
 
         contacts_out: list[dict[str, Any]] = []
-        unique_company_role_pairs = {
-            (internship.company, internship.role) for internship in ranked_internships[:4] if internship.company
-        }
+        qualified_jobs: list[dict[str, Any]] = []
+        linkedin_matches = 0
 
-        for company, internship_role in sorted(unique_company_role_pairs):
-            company_start = time.perf_counter()
-            discovered = linkedin.discover_contacts(
-                company,
-                internship_role or target_role,
-                limit=TARGET_CONTACTS_PER_COMPANY,
-            )
+        for internship in ranked_internships:
+            company = internship.company
+            internship_role = internship.role or target_role
+            if not company.strip():
+                continue
+
+            body = f"{internship.role} {internship.description} {internship.requirements}".lower()
+            if "intern" not in internship.role.lower():
+                continue
+            if len(internship.description.strip()) < 60:
+                continue
+            if not any(token in body for token in {"machine learning", "ml", "ai", "data science"}):
+                continue
+
+            discovered = linkedin.discover_contacts(company, internship_role, limit=TARGET_CONTACTS_PER_COMPANY)
             deduped_contacts = _dedupe_contacts(discovered, company)[:TARGET_CONTACTS_PER_COMPANY]
-            logger.info(
-                "Contacts generated: company='%s' role='%s' discovered=%s deduped=%s",
-                company,
-                internship_role,
-                len(discovered),
-                len(deduped_contacts),
+            if not deduped_contacts:
+                continue
+
+            linkedin_matches += len(deduped_contacts)
+            best_contact = deduped_contacts[0]
+            quality_score = _internship_quality_score(internship, best_contact)
+            qualified_jobs.append(
+                {
+                    "title": internship.role,
+                    "company": internship.company,
+                    "location": "Singapore" if "singapore" in body else "Unknown",
+                    "description": internship.description,
+                    "linkedin_contact": {
+                        "name": best_contact.name,
+                        "role": best_contact.role,
+                        "linkedin_url": best_contact.linkedin_url,
+                    },
+                    "quality_score": quality_score,
+                }
             )
 
-            email_by_contact_id: dict[str, Any] = {}
-            for contact in deduped_contacts:
-                state.contacts[contact.id] = contact
-                database.upsert_contact(contact.model_dump(exclude={"experience", "activity"}))
-                email_record = email_service.enrich(contact, company_best_email.get(company))
-                if email_record:
-                    state.emails[email_record.id] = email_record.model_dump()
-                    email_by_contact_id[contact.id] = email_record
-                    database.upsert_email(
-                        {
-                            "id": email_record.id,
-                            "contact_id": email_record.contact_id,
-                            "email": email_record.email,
-                            "confidence_score": email_record.confidence_score,
-                        }
-                    )
+        final_jobs = sorted(qualified_jobs, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
+        if len(final_jobs) >= FINAL_MIN_RESULTS:
+            final_jobs = final_jobs[:FINAL_MAX_RESULTS]
 
-            scored = scoring.score(deduped_contacts, internship_role or target_role, university, email_by_contact_id)
-            logger.info(
-                "Scoring distribution: company='%s' min=%.2f max=%.2f count=%s",
-                company,
-                min([row.final_score for row in scored], default=0.0),
-                max([row.final_score for row in scored], default=0.0),
-                len(scored),
-            )
-            filtered = scoring.apply_hard_filters(
-                deduped_contacts,
-                scored,
-                email_by_contact_id,
-                max_per_company=TARGET_CONTACTS_PER_COMPANY,
-                min_per_company=MIN_CONTACTS_PER_COMPANY,
-            )
-            top_contacts = sorted(filtered, key=lambda row: row[1].final_score, reverse=True)[
-                :TARGET_CONTACTS_PER_COMPANY
-            ]
-            logger.info(
-                "Contacts filtered: company='%s' kept=%s duration=%.2fs",
-                company,
-                len(top_contacts),
-                time.perf_counter() - company_start,
-            )
-
-            key = _result_key(company, internship_role or target_role)
-            state.contact_results_by_key[key] = []
-            for contact, score_row in top_contacts:
-                email_row = email_by_contact_id.get(contact.id)
-                strategy.decide(contact, email_row)
-                state.contact_scores[contact.id] = score_row.model_dump()
-                database.upsert_contact_score(score_row.model_dump())
-                formatted = _format_contact_output(contact, score_row, email_row)
-                state.contact_results_by_key[key].append(formatted)
-                contacts_out.append(formatted)
+        logger.info(
+            "Pipeline strict metrics: %s",
+            {
+                "expanded_queries": scraper.expand_query(target_role),
+                "raw_results": len(internships),
+                "after_filtering": len(qualified_jobs),
+                "linkedin_found": linkedin_matches,
+                "final_count": len(final_jobs),
+            },
+        )
 
         return {
             "user": state.users[user_id].model_dump(),
             "cv_text": cv_text,
-            "internships": [internship.model_dump() for internship in ranked_internships],
+            "internships": final_jobs,
             "contacts": contacts_out,
+            "reason": (
+                None
+                if final_jobs
+                else "No high-quality internships found with identifiable LinkedIn contacts"
+            ),
+            "debug": {
+                "raw_count": len(internships),
+                "filtered_count": len(qualified_jobs),
+                "linkedin_matches": linkedin_matches,
+            },
         }
 
     @router.get("/contacts")
