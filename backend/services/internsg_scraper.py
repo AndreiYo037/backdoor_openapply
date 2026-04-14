@@ -4,12 +4,13 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from difflib import SequenceMatcher
+from typing import Any
 from urllib.parse import quote_plus
 
 import requests
-from bs4 import BeautifulSoup
 
 from backend.models.internship import Internship
 
@@ -18,6 +19,42 @@ INTERNSG_SEARCH_URL = "https://www.internsg.com/job/?f_p={query}"
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 MOCK_COMPANY_MARKERS = {"sample internsg company", "demo internsg employer", "sample company", "demo company"}
 logger = logging.getLogger(__name__)
+REQUEST_TIMEOUT_SECONDS = 8
+MAX_RETRIES = 2
+TINYFISH_MAX_QUERY_ATTEMPTS = 3
+TINYFISH_MAX_RUNTIME_SECONDS = 25
+
+QUERY_EXPANSION_RULES: list[tuple[tuple[str, ...], list[str]]] = [
+    (
+        ("machine learning", "ml", "artificial intelligence", "ai"),
+        [
+            "machine learning intern",
+            "ml intern",
+            "data science intern",
+            "ai intern",
+            "machine learning internship singapore",
+        ],
+    ),
+    (
+        ("software engineer", "software developer", "developer"),
+        [
+            "software engineer intern",
+            "software developer intern",
+            "backend intern",
+            "frontend intern",
+            "full stack intern singapore",
+        ],
+    ),
+    (
+        ("data", "analytics", "analyst"),
+        [
+            "data analyst intern",
+            "data science intern",
+            "business analytics intern",
+            "data internship singapore",
+        ],
+    ),
+]
 
 
 @dataclass
@@ -36,15 +73,19 @@ class RawInternshipRow:
 
 
 class InternSGScraper:
-    """TinyFish-powered InternSG scraper (non-restricted source only)."""
+    """Strict TinyFish-only InternSG scraper."""
 
-    def __init__(self, timeout_seconds: int = 12, max_stream_seconds: int = 25) -> None:
+    def __init__(self, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS, max_stream_seconds: int = 12) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_stream_seconds = max_stream_seconds
 
     def scrape(self, role_query: str, limit: int = 25) -> list[Internship]:
+        rows = self._fetch_from_tinyfish(self.expand_query(role_query), limit=limit)
+        merged = self._merge_and_score_rows(rows, role_query)
+        logger.info("Merged internship rows count=%s", len(merged))
+
         internships: list[Internship] = []
-        for row in self._fetch_rows(role_query, limit=limit):
+        for row in merged:
             if row.company.lower() in MOCK_COMPANY_MARKERS:
                 continue
             has_required_fields = bool(
@@ -63,40 +104,55 @@ class InternSGScraper:
                     source="InternSG",
                 )
             )
-            # Stop early once enough quality internships are collected.
             if len(internships) >= limit:
                 break
-        logger.info("InternSG scrape complete: query='%s' count=%s", role_query, len(internships))
-        if internships:
-            sample = internships[0]
-            logger.info(
-                "InternSG sample job: company='%s' role='%s' has_email=%s",
-                sample.company,
-                sample.role,
-                bool(sample.application_email),
-            )
+
+        logger.info("Final returned internship count=%s", len(internships))
+        if not internships:
+            raise RuntimeError("No valid internships returned by TinyFish for this query.")
         return internships
 
-    def _fetch_rows(self, role_query: str, limit: int) -> Iterable[RawInternshipRow]:
+    def expand_query(self, role: str) -> list[str]:
+        lowered = role.lower().strip()
+        expanded: list[str] = []
+        for keywords, candidates in QUERY_EXPANSION_RULES:
+            if any(keyword in lowered for keyword in keywords):
+                expanded.extend(candidates)
+        if not expanded:
+            expanded.extend([f"{lowered} intern", f"{lowered} internship singapore", lowered])
+
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for query in expanded:
+            key = query.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(query.strip())
+        logger.info("Expanded queries: %s", deduped)
+        return deduped
+
+    def _fetch_from_tinyfish(self, expanded_queries: list[str], limit: int) -> list[RawInternshipRow]:
         api_key = os.getenv("TINYFISH_API_KEY", "").strip()
         if not api_key:
-            logger.warning("TINYFISH_API_KEY missing. Falling back to direct InternSG scraping.")
-            direct_rows = list(self._fetch_rows_direct(role_query, limit))
-            if direct_rows:
-                yield from direct_rows
-            else:
-                logger.warning("Direct InternSG scraping returned no rows; using WordPress post fallback.")
-                yield from self._fetch_rows_wordpress(role_query, limit)
-            return
+            raise RuntimeError("TINYFISH_API_KEY is required for strict TinyFish mode.")
 
-        url = INTERNSG_SEARCH_URL.format(query=quote_plus(role_query))
-        try:
-            logger.info("Using TinyFish as primary InternSG source.")
-            response = requests.post(
-                TINYFISH_ENDPOINT,
+        rows: list[RawInternshipRow] = []
+        start = time.perf_counter()
+        for query in expanded_queries[:TINYFISH_MAX_QUERY_ATTEMPTS]:
+            if time.perf_counter() - start >= TINYFISH_MAX_RUNTIME_SECONDS:
+                logger.warning("TinyFish global budget exceeded; stopping TinyFish queries.")
+                break
+            source_url = INTERNSG_SEARCH_URL.format(query=quote_plus(query))
+            remaining = max(TINYFISH_MAX_RUNTIME_SECONDS - (time.perf_counter() - start), 1.0)
+            effective_timeout = min(self.timeout_seconds, remaining)
+            effective_stream_cap = min(self.max_stream_seconds, max(int(remaining), 1))
+
+            response = self._retry_request(
+                method="POST",
+                url=TINYFISH_ENDPOINT,
                 headers={"Content-Type": "application/json", "X-API-Key": api_key},
-                json={
-                    "url": url,
+                json_payload={
+                    "url": source_url,
                     "goal": (
                         "Read this InternSG search result page and collect up to "
                         f"{min(limit, 30)} internships. Return JSON array rows with "
@@ -105,172 +161,104 @@ class InternSGScraper:
                     "browser_profile": "stealth",
                     "api_integration": "openapply",
                 },
-                timeout=self.timeout_seconds,
                 stream=True,
+                timeout_override=effective_timeout,
             )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            logger.warning("TinyFish scrape failed (%s). Falling back to direct scraping.", exc)
-            direct_rows = list(self._fetch_rows_direct(role_query, limit))
-            if direct_rows:
-                yield from direct_rows
-            else:
-                logger.warning("Direct InternSG scraping returned no rows; using WordPress post fallback.")
-                yield from self._fetch_rows_wordpress(role_query, limit)
-            return
-        events = self._parse_sse_events(response)
-        response.close()
-        records = self._extract_listing_records(events)[:limit]
-        if not records:
-            logger.warning("TinyFish returned no internship rows; falling back to WordPress post feed.")
-            yield from self._fetch_rows_wordpress(role_query, limit)
-            return
-        logger.info("TinyFish produced %s internship rows before filtering.", len(records))
-
-        for idx, record in enumerate(records):
-            title = self._as_string(record.get("job_title")) or self._as_string(record.get("title"))
-            company = self._as_string(record.get("company"))
-            if not title or not company:
+            if not response:
                 continue
-            description = self._as_string(record.get("description"))
-            requirements = self._as_string(record.get("requirements")) or description
-            email = self._as_string(record.get("application_email"))
-            email_match = EMAIL_PATTERN.search(email or f"{description} {requirements}")
-            yield RawInternshipRow(
-                title=title,
-                company=company,
-                description=description,
-                requirements=requirements,
-                application_email=email_match.group(0) if email_match else None,
-            )
-
-    def _fetch_rows_direct(self, role_query: str, limit: int) -> Iterable[RawInternshipRow]:
-        url = INTERNSG_SEARCH_URL.format(query=quote_plus(role_query))
-        try:
-            response = requests.get(
-                url,
-                timeout=self.timeout_seconds,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise RuntimeError("InternSG direct scraping failed. Try again later.") from exc
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        cards = soup.select("article, .job-listing, .job-item, .grid .border")
-        seen: set[tuple[str, str]] = set()
-
-        for card in cards:
-            text = " ".join(card.stripped_strings)
-            if not text:
-                continue
-            title = self._extract_title_from_card(card, text)
-            company = self._extract_company_from_card(card, text)
-            if not title or not company:
-                continue
-            key = (title.lower(), company.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            email_match = EMAIL_PATTERN.search(text)
-            description = text[:500]
-            requirements = description
-            yield RawInternshipRow(
-                title=title,
-                company=company,
-                description=description,
-                requirements=requirements,
-                application_email=email_match.group(0) if email_match else None,
-            )
-            if len(seen) >= limit:
+            events = self._parse_sse_events(response, max_stream_seconds=effective_stream_cap)
+            response.close()
+            for record in self._extract_listing_records(events):
+                parsed = self._row_from_record(record)
+                if parsed:
+                    rows.append(parsed)
+                if len(rows) >= limit * 3:
+                    break
+            if len(rows) >= limit * 3:
                 break
 
-    def _fetch_rows_wordpress(self, role_query: str, limit: int) -> Iterable[RawInternshipRow]:
-        api_url = "https://www.internsg.com/wp-json/wp/v2/posts"
-        try:
-            response = requests.get(
-                api_url,
-                params={"search": role_query, "per_page": min(max(limit, 5), 20), "orderby": "date", "order": "desc"},
-                timeout=self.timeout_seconds,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            response.raise_for_status()
-            posts = response.json()
-        except requests.RequestException as exc:
-            raise RuntimeError("InternSG fallback feed failed. Try again later.") from exc
+        logger.info("Per-source results: tinyfish=%s", len(rows))
+        return rows
+
+    def _retry_request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        stream: bool = False,
+        timeout_override: float | None = None,
+    ) -> requests.Response | None:
+        timeout_seconds = self.timeout_seconds if timeout_override is None else timeout_override
+        for attempt in range(1, MAX_RETRIES + 2):
+            try:
+                response = requests.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_payload,
+                    timeout=timeout_seconds,
+                    stream=stream,
+                )
+                response.raise_for_status()
+                return response
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Request failed [%s] attempt %s/%s: %s",
+                    url,
+                    attempt,
+                    MAX_RETRIES + 1,
+                    exc,
+                )
+        return None
+
+    def _row_from_record(self, record: dict[str, Any]) -> RawInternshipRow | None:
+        title = self._as_string(record.get("job_title")) or self._as_string(record.get("title"))
+        company = self._as_string(record.get("company"))
+        if not title or not company:
+            return None
+        description = self._as_string(record.get("description"))
+        requirements = self._as_string(record.get("requirements")) or description
+        email = self._as_string(record.get("application_email"))
+        email_match = EMAIL_PATTERN.search(email or f"{description} {requirements}")
+        return RawInternshipRow(
+            title=title,
+            company=company,
+            description=description,
+            requirements=requirements,
+            application_email=email_match.group(0) if email_match else None,
+        )
+
+    def _merge_and_score_rows(self, rows: list[RawInternshipRow], role_query: str) -> list[RawInternshipRow]:
+        deduped: dict[tuple[str, str], RawInternshipRow] = {}
+        for row in rows:
+            key = (row.company.strip().lower(), row.title.strip().lower())
+            if key[0] and key[1] and key not in deduped:
+                deduped[key] = row
 
         role_tokens = {token for token in re.findall(r"[a-zA-Z]+", role_query.lower()) if len(token) > 2}
-        seen: set[tuple[str, str]] = set()
-        for post in posts:
-            raw_title = self._as_string(BeautifulSoup(str(post.get("title", {}).get("rendered", "")), "html.parser").get_text(" ", strip=True))
-            description = self._as_string(
-                BeautifulSoup(str(post.get("excerpt", {}).get("rendered", "")), "html.parser").get_text(" ", strip=True)
-            )
-            if not raw_title or not description:
-                continue
 
-            lowered = f"{raw_title} {description}".lower()
-            overlap = len(role_tokens & set(re.findall(r"[a-zA-Z]+", lowered)))
-            if role_tokens and overlap == 0:
-                continue
+        def score(row: RawInternshipRow) -> float:
+            haystack = f"{row.title} {row.description} {row.requirements}".lower()
+            hay_tokens = set(re.findall(r"[a-zA-Z]+", haystack))
+            keyword_match_score = len(role_tokens & hay_tokens) / max(len(role_tokens), 1)
+            title_similarity_score = SequenceMatcher(None, role_query.lower(), row.title.lower()).ratio()
+            location_match_boost = 0.2 if "singapore" in haystack else 0.0
+            return keyword_match_score + title_similarity_score + location_match_boost
 
-            company, role = self._split_company_role(raw_title)
-            if not company or not role:
-                continue
-            key = (company.lower(), role.lower())
-            if key in seen:
-                continue
-            seen.add(key)
+        return sorted(deduped.values(), key=score, reverse=True)
 
-            email_match = EMAIL_PATTERN.search(description)
-            yield RawInternshipRow(
-                title=role,
-                company=company,
-                description=description[:500],
-                requirements=description[:500],
-                application_email=email_match.group(0) if email_match else None,
-            )
-            if len(seen) >= limit:
-                break
-
-    def _split_company_role(self, title: str) -> tuple[str, str]:
-        cleaned = title.replace("&#8211;", "-").replace("–", "-").replace("—", "-")
-        parts = [part.strip() for part in cleaned.split("-") if part.strip()]
-        if len(parts) >= 2:
-            return parts[0][:120], parts[1][:160]
-        return "", ""
-
-    def _extract_title_from_card(self, card: Any, fallback_text: str) -> str:
-        for selector in ["h1", "h2", "h3", ".job-title", "a[title]"]:
-            node = card.select_one(selector)
-            if node:
-                text = self._as_string(node.get_text(" ", strip=True))
-                if text:
-                    return text
-        return self._as_string(fallback_text.split("  ")[0][:120])
-
-    def _extract_company_from_card(self, card: Any, fallback_text: str) -> str:
-        for selector in [".company", ".job-company", ".text-muted", ".text-gray-500"]:
-            node = card.select_one(selector)
-            if node:
-                text = self._as_string(node.get_text(" ", strip=True))
-                if text:
-                    return text
-        parts = [part.strip() for part in re.split(r"[-|•]", fallback_text) if part.strip()]
-        if len(parts) > 1:
-            return self._as_string(parts[1][:120])
-        return ""
-
-    def _parse_sse_events(self, response: requests.Response) -> list[TinyFishEvent]:
-        import time
-
+    def _parse_sse_events(self, response: requests.Response, max_stream_seconds: int | None = None) -> list[TinyFishEvent]:
         events: list[TinyFishEvent] = []
         start = time.perf_counter()
         event_name = "message"
         data_lines: list[str] = []
+        stream_cap = self.max_stream_seconds if max_stream_seconds is None else max_stream_seconds
         for line in response.iter_lines(decode_unicode=True):
-            if time.perf_counter() - start >= self.max_stream_seconds:
-                logger.warning("InternSG SSE parsing reached %ss cap; returning partial results.", self.max_stream_seconds)
+            if time.perf_counter() - start >= stream_cap:
+                logger.warning("InternSG SSE parsing reached %ss cap; returning partial results.", stream_cap)
                 break
             if line is None:
                 continue
