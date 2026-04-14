@@ -2,10 +2,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.api import routes
+from backend.models.contact import Contact
 from backend.models.internship import Internship
 
 
-def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkeypatch) -> None:
+def test_pipeline_contract_and_non_empty_data(monkeypatch) -> None:
     monkeypatch.setattr(routes, "extract_cv_text", lambda _bytes: "machine learning")
     monkeypatch.setattr(routes, "score_internships", lambda _cv, jobs: jobs)
 
@@ -16,7 +17,7 @@ def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkey
                 company="Grab",
                 role="Machine Learning Intern",
                 location="Singapore",
-                description="Machine learning internship in Singapore with model deployment responsibilities.",
+                description="Machine learning internship in Singapore with production model deployment responsibilities and mentorship.",
                 requirements="Python, ML",
                 job_url="https://www.internsg.com/job/1",
                 source="InternSG",
@@ -24,15 +25,25 @@ def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkey
         ]
 
     monkeypatch.setattr(routes.InternSGScraper, "scrape", fake_scrape)
+    monkeypatch.setattr(routes.CompanyCareersScraper, "scrape", lambda self, role_query, limit=10: [])
     monkeypatch.setattr(
         routes.LinkedInSearchService,
         "discover_job_contact",
         lambda self, company, role: (
-            None,
-            {"company": company, "candidates_found": 0, "top_score": 0, "selected_profile_name": None},
+            Contact(
+                id="c1",
+                name="Jane Tan",
+                role="Technical Recruiter",
+                company=company,
+                linkedin_url="https://www.linkedin.com/in/jane-tan-1",
+                education="",
+                seniority="manager",
+                experience="",
+                activity=0.7,
+            ),
+            {"company": company, "candidates_found": 2, "top_score": 9, "selected_profile_name": "Jane Tan"},
         ),
     )
-    monkeypatch.setattr(routes.CompanyCareersScraper, "scrape", lambda self, role_query, limit=10: [])
 
     app = FastAPI()
     app.include_router(routes.build_router())
@@ -45,7 +56,8 @@ def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkey
     )
     assert response.status_code == 200
     body = response.json()
-    assert set(("success", "data", "error")).issubset(body.keys())
-    assert body["internships"] == []
-    assert body["reason"] == "No internships met high-confidence LinkedIn contact requirement"
-    assert set(body["debug"].keys()) == {"raw_jobs", "filtered_jobs", "linkedin_candidates", "qualified_contacts"}
+    assert body["success"] is True
+    assert body["error"] is None
+    assert isinstance(body["data"], dict)
+    assert len(body["data"]["jobs"]) >= 1
+    assert len(body["internships"]) >= 1

@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from backend.api.routes import build_router
+from backend.storage.database import PersistentDatabase
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -23,13 +24,22 @@ app.add_middleware(
 )
 
 app.include_router(build_router())
+database = PersistentDatabase()
 
 
 @app.get("/")
-def root() -> dict[str, str]:
-    return {"status": "ok", "message": "Backdoor API is running", "health": "/health", "docs": "/docs"}
+def root() -> dict[str, object]:
+    return {
+        "success": True,
+        "data": {"status": "ok", "message": "Backdoor API is running", "health": "/health", "docs": "/docs"},
+        "error": None,
+    }
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, object]:
+    return {
+        "success": True,
+        "data": {"api": "ok", "storage": "ok" if database.health_check() else "error"},
+        "error": None,
+    }

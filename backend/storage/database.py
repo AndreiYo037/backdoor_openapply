@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class PersistentDatabase:
@@ -14,8 +17,10 @@ class PersistentDatabase:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
+        logger.info("[Storage] Connect -> Input: db_path=%s", self.db_path)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        logger.info("[Storage] Connect -> Output: ok")
         return conn
 
     def _init_schema(self) -> None:
@@ -84,8 +89,10 @@ class PersistentDatabase:
                 );
                 """
             )
+        logger.info("[Storage] InitSchema -> Output: ready")
 
     def upsert_user(self, user: dict[str, Any]) -> None:
+        logger.info("[Storage] UpsertUser -> Input: id=%s", user.get("id"))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -99,8 +106,10 @@ class PersistentDatabase:
                 """,
                 user,
             )
+        logger.info("[Storage] UpsertUser -> Output: ok")
 
     def upsert_internship(self, internship: dict[str, Any]) -> None:
+        logger.info("[Storage] UpsertInternship -> Input: id=%s", internship.get("id"))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -116,8 +125,10 @@ class PersistentDatabase:
                 """,
                 internship,
             )
+        logger.info("[Storage] UpsertInternship -> Output: ok")
 
     def upsert_contact(self, contact: dict[str, Any]) -> None:
+        logger.info("[Storage] UpsertContact -> Input: id=%s", contact.get("id"))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -133,8 +144,10 @@ class PersistentDatabase:
                 """,
                 contact,
             )
+        logger.info("[Storage] UpsertContact -> Output: ok")
 
     def upsert_email(self, email_row: dict[str, Any]) -> None:
+        logger.info("[Storage] UpsertEmail -> Input: id=%s", email_row.get("id"))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -147,8 +160,10 @@ class PersistentDatabase:
                 """,
                 email_row,
             )
+        logger.info("[Storage] UpsertEmail -> Output: ok")
 
     def upsert_contact_score(self, score_row: dict[str, Any]) -> None:
+        logger.info("[Storage] UpsertContactScore -> Input: contact_id=%s", score_row.get("contact_id"))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -167,8 +182,10 @@ class PersistentDatabase:
                 """,
                 score_row,
             )
+        logger.info("[Storage] UpsertContactScore -> Output: ok")
 
     def insert_outreach_log(self, row: dict[str, Any]) -> None:
+        logger.info("[Storage] InsertOutreachLog -> Input: id=%s", row.get("id"))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -179,8 +196,10 @@ class PersistentDatabase:
                 """,
                 row,
             )
+        logger.info("[Storage] InsertOutreachLog -> Output: ok")
 
     def count_sent_today(self, user_id: str, iso_date: str) -> int:
+        logger.info("[Storage] CountSentToday -> Input: user_id=%s date=%s", user_id, iso_date)
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -190,7 +209,9 @@ class PersistentDatabase:
                 """,
                 (user_id, iso_date),
             ).fetchone()
-        return int(row["total"]) if row else 0
+        total = int(row["total"]) if row else 0
+        logger.info("[Storage] CountSentToday -> Output: total=%s", total)
+        return total
 
     def table_counts(self) -> dict[str, int]:
         table_names = [
@@ -206,4 +227,16 @@ class PersistentDatabase:
             for table in table_names:
                 row = conn.execute(f"SELECT COUNT(*) AS total FROM {table}").fetchone()
                 counts[table] = int(row["total"]) if row else 0
+        logger.info("[Storage] TableCounts -> Output: %s", counts)
         return counts
+
+    def health_check(self) -> bool:
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT 1 AS ok").fetchone()
+            ok = bool(row and int(row["ok"]) == 1)
+            logger.info("[Storage] HealthCheck -> Output: ok=%s", ok)
+            return ok
+        except Exception as exc:
+            logger.exception("[Storage] HealthCheck -> Error: %s", exc)
+            return False
