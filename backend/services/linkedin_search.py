@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import json
+import random
 import re
 import time
+from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
 import requests
@@ -10,14 +11,9 @@ from bs4 import BeautifulSoup
 
 from backend.models.contact import Contact
 
-DUCKDUCKGO_HTML_ENDPOINT = "https://duckduckgo.com/html/"
-BING_SEARCH_ENDPOINT = "https://www.bing.com/search"
-LINKEDIN_PROFILE_PATTERN = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#]+", re.I)
-ROLE_HINT_KEYWORDS = {
-    "recruiter": {"recruit", "talent", "hiring", "sourcing", "acquisition"},
-    "engineering": {"engineer", "developer", "software", "frontend", "backend", "full stack", "tech"},
-    "product": {"product", "pm"},
-}
+GOOGLE_SEARCH_ENDPOINT = "https://www.google.com/search"
+LINKEDIN_PROFILE_PATTERN = re.compile(r"^https://www\.linkedin\.com/in/[^/?#]+", re.I)
+BAD_URL_MARKERS = ("/company/", "/jobs/", "/dir/", "/pub/", "/authwall", "linkedin.com/login")
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -28,224 +24,169 @@ def _extract_clean_linkedin_url(raw_href: str) -> str | None:
     if not raw_href:
         return None
     href = raw_href.strip()
-    if href.startswith("//"):
-        href = f"https:{href}"
-    if href.startswith("/"):
+    if href.startswith("/url?q="):
+        href = href.split("/url?q=", 1)[1].split("&", 1)[0]
+    href = unquote(href)
+    if not LINKEDIN_PROFILE_PATTERN.match(href):
         return None
-
-    parsed = urlparse(href)
-    if parsed.netloc.endswith("duckduckgo.com") and parsed.path == "/l/":
-        query_match = re.search(r"[?&]uddg=([^&]+)", href)
-        if query_match:
-            href = unquote(query_match.group(1))
-
-    if LINKEDIN_PROFILE_PATTERN.match(href):
-        return href.split("?", 1)[0].split("#", 1)[0]
-    return None
+    lowered = href.lower()
+    if any(marker in lowered for marker in BAD_URL_MARKERS):
+        return None
+    return href.split("?", 1)[0].split("#", 1)[0]
 
 
-def _derive_name_from_slug(profile_url: str) -> str:
-    slug = profile_url.rstrip("/").split("/in/")[-1]
-    slug = re.sub(r"[^a-zA-Z\- ]", " ", slug)
-    parts = [part for part in re.split(r"[-\s]+", slug) if part]
-    cleaned: list[str] = []
-    for part in parts:
-        if len(part) <= 1 or part.isdigit():
-            continue
-        if part.lower() in {"linkedin", "profile"}:
-            continue
-        cleaned.append(part.capitalize())
-    if len(cleaned) >= 2:
-        return f"{cleaned[0]} {cleaned[1]}"
-    if cleaned:
-        return cleaned[0]
-    return "Unknown Contact"
-
-
-def _extract_name_from_title(raw_title: str, fallback_url: str) -> str:
-    title = _normalize_whitespace(raw_title)
-    if not title:
-        return _derive_name_from_slug(fallback_url)
-    if " - " in title:
-        return title.split(" - ", 1)[0].strip()
-    if " | " in title:
-        return title.split(" | ", 1)[0].strip()
-    return _derive_name_from_slug(fallback_url)
-
-
-def _pick_contact_role(title_text: str, snippet: str, requested_role: str) -> tuple[str, str]:
-    haystack = f"{title_text} {snippet}".lower()
-    if any(keyword in haystack for keyword in ROLE_HINT_KEYWORDS["recruiter"]):
-        return ("Talent Acquisition Partner", "manager")
-    if any(keyword in haystack for keyword in ROLE_HINT_KEYWORDS["product"]):
-        return ("Product Manager", "manager")
-    if any(keyword in haystack for keyword in ROLE_HINT_KEYWORDS["engineering"]):
-        return ("Software Engineer", "individual_contributor")
-    if "manager" in haystack or "head of" in haystack or "lead" in haystack:
-        return ("Hiring Manager", "manager")
-    return (f"{requested_role} Recruiter", "manager")
-
-
-def _role_alignment_score(role: str, snippet: str, requested_role: str) -> float:
-    requested_tokens = {token for token in requested_role.lower().split() if token}
-    haystack_tokens = set(re.findall(r"[a-zA-Z]+", f"{role} {snippet}".lower()))
-    overlap = len(requested_tokens & haystack_tokens) / max(len(requested_tokens), 1)
-    recruiter_bonus = 0.2 if any(word in haystack_tokens for word in {"recruiter", "talent", "hiring"}) else 0.0
-    return min(overlap + recruiter_bonus, 1.0)
+@dataclass
+class LinkedInCandidate:
+    name: str
+    title: str
+    snippet: str
+    url: str
+    score: int
 
 
 class LinkedInSearchService:
-    """Discover likely LinkedIn profiles from public web search results."""
-
-    def __init__(self, timeout_seconds: int = 2, max_runtime_seconds: int = 3) -> None:
+    def __init__(self, timeout_seconds: int = 4, max_runtime_seconds: int = 16) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_runtime_seconds = max_runtime_seconds
+        self._cache: dict[str, list[dict[str, str]]] = {}
 
-    def discover_contacts(self, company: str, role: str, limit: int = 12) -> list[Contact]:
-        start = time.perf_counter()
-        safe_limit = max(1, min(limit, 20))
-        queries = [
-            f'"{company}" recruiter linkedin',
-            f'"{company}" talent acquisition linkedin',
-            f'"{company}" machine learning linkedin',
-            f'"{company}" data science linkedin',
+    def build_queries(self, company: str, role: str) -> list[str]:
+        return [
+            f'site:linkedin.com/in "{company}" recruiter Singapore',
+            f'site:linkedin.com/in "{company}" "talent acquisition" Singapore',
+            f'site:linkedin.com/in "{company}" hiring manager Singapore',
+            f'site:linkedin.com/in "{company}" "{role}" Singapore',
+            f'site:linkedin.com/in "{company}" "{role} engineer" Singapore',
         ]
 
-        seen_urls: set[str] = set()
-        candidates: list[tuple[float, Contact]] = []
-        company_slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-") or "company"
-
-        for query in queries:
-            if time.perf_counter() - start >= self.max_runtime_seconds:
-                break
-            remaining = max(self.max_runtime_seconds - (time.perf_counter() - start), 0.5)
-            timeout = min(self.timeout_seconds, remaining)
-            for result in self._search_duckduckgo(query, timeout):
-                if self._try_add_candidate(result, company, role, company_slug, seen_urls, candidates):
-                    if len(candidates) >= safe_limit * 2:
-                        break
-            if len(candidates) >= safe_limit * 2:
-                break
-
-            if time.perf_counter() - start >= self.max_runtime_seconds:
-                break
-            remaining = max(self.max_runtime_seconds - (time.perf_counter() - start), 0.5)
-            timeout = min(self.timeout_seconds, remaining)
-            for result in self._search_bing(query, timeout):
-                if self._try_add_candidate(result, company, role, company_slug, seen_urls, candidates):
-                    if len(candidates) >= safe_limit * 2:
-                        break
-            if len(candidates) >= safe_limit * 2:
-                break
-
-        if not candidates:
-            # Return an empty list instead of made-up profile URLs.
-            return []
-
-        ranked = sorted(candidates, key=lambda row: row[0], reverse=True)
-        return [contact for _, contact in ranked[:safe_limit]]
-
-    def _search_duckduckgo(self, query: str, timeout_seconds: float) -> list[dict[str, str]]:
-        try:
-            response = requests.get(
-                DUCKDUCKGO_HTML_ENDPOINT,
-                params={"q": query},
-                timeout=timeout_seconds,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            result_nodes = soup.select("a.result__a")
-            rows: list[dict[str, str]] = []
-            for node in result_nodes:
-                wrapper = node.find_parent("div", class_="result")
-                snippet_node = wrapper.select_one(".result__snippet") if wrapper else None
-                snippet = _normalize_whitespace(snippet_node.get_text(" ", strip=True) if snippet_node else "")
-                title_text = _normalize_whitespace(node.get_text(" ", strip=True))
-                rows.append({"href": node.get("href", ""), "title": title_text, "snippet": snippet})
-            return rows
-        except Exception:
-            return []
-
-    def _search_bing(self, query: str, timeout_seconds: float) -> list[dict[str, str]]:
-        try:
-            response = requests.get(
-                BING_SEARCH_ENDPOINT,
-                params={"q": query},
-                timeout=timeout_seconds,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            rows: list[dict[str, str]] = []
-            for node in soup.select("li.b_algo"):
-                anchor = node.select_one("h2 a")
-                if not anchor:
-                    continue
-                title_text = _normalize_whitespace(anchor.get_text(" ", strip=True))
-                snippet_node = node.select_one(".b_caption p")
-                snippet = _normalize_whitespace(snippet_node.get_text(" ", strip=True) if snippet_node else "")
-                rows.append({"href": anchor.get("href", ""), "title": title_text, "snippet": snippet})
-            return rows
-        except Exception:
-            return []
-
-    def _try_add_candidate(
-        self,
-        result_row: dict[str, str],
-        company: str,
-        role: str,
-        company_slug: str,
-        seen_urls: set[str],
-        candidates: list[tuple[float, Contact]],
-    ) -> bool:
-        url = _extract_clean_linkedin_url(result_row.get("href", ""))
-        if not url or url in seen_urls:
-            return False
-        lowered_url = url.lower()
-        if any(token in lowered_url for token in ("/company/", "/jobs/", "/authwall", "linkedin.com/signup")):
-            return False
-
-        title_text = result_row.get("title", "")
-        snippet = result_row.get("snippet", "")
-        if company.lower() not in f"{title_text} {snippet}".lower():
-            return False
-        relevance_text = f"{title_text} {snippet}".lower()
-        relevant_markers = {
-            "recruiter",
-            "talent acquisition",
-            "hiring",
-            "machine learning",
-            "data science",
-            "ai",
-            "engineer",
-        }
-        if not any(marker in relevance_text for marker in relevant_markers):
-            return False
-
-        inferred_name = _extract_name_from_title(title_text, url)
-        inferred_role, seniority = _pick_contact_role(title_text, snippet, role)
-        relevance = _role_alignment_score(inferred_role, snippet, role)
-        years = 2 + int(relevance * 8)
-        activity = min(0.45 + (0.5 * relevance), 0.95)
-        role_slug = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "role"
-
-        seen_urls.add(url)
-        candidates.append(
-            (
-                relevance,
+    def discover_contacts(self, company: str, role: str, limit: int = 5) -> list[Contact]:
+        candidates = self._discover_candidates(company, role)
+        best = [candidate for candidate in candidates if candidate.score >= 6]
+        safe_limit = max(1, min(limit, 5))
+        contacts: list[Contact] = []
+        for idx, candidate in enumerate(best[:safe_limit], start=1):
+            contacts.append(
                 Contact(
-                    id=f"{company_slug}-{role_slug}-{len(seen_urls)}",
-                    name=inferred_name,
-                    role=inferred_role,
+                    id=f"{re.sub(r'[^a-z0-9]+', '-', company.lower()).strip('-') or 'company'}-{idx}",
+                    name=candidate.name,
+                    role=candidate.title,
                     company=company,
-                    linkedin_url=url,
+                    linkedin_url=candidate.url,
                     education="",
-                    seniority=seniority,
-                    experience=f"{years} years",
-                    activity=activity,
-                ),
+                    seniority="manager" if "manager" in candidate.title else "individual_contributor",
+                    experience="",
+                    activity=0.7,
+                )
             )
+        return contacts
+
+    def discover_job_contact(self, company: str, role: str) -> tuple[Contact | None, dict[str, object]]:
+        candidates = self._discover_candidates(company, role)
+        selected = next((candidate for candidate in candidates if candidate.score >= 6), None)
+        debug = {
+            "company": company,
+            "candidates_found": len(candidates),
+            "top_score": candidates[0].score if candidates else 0,
+            "selected_profile_name": selected.name if selected else None,
+        }
+        if not selected:
+            return None, debug
+        contact = Contact(
+            id=f"{re.sub(r'[^a-z0-9]+', '-', company.lower()).strip('-') or 'company'}-best",
+            name=selected.name,
+            role=selected.title,
+            company=company,
+            linkedin_url=selected.url,
+            education="",
+            seniority="manager" if "manager" in selected.title else "individual_contributor",
+            experience="",
+            activity=0.7,
         )
-        return True
+        return contact, debug
+
+    def _discover_candidates(self, company: str, role: str) -> list[LinkedInCandidate]:
+        start = time.perf_counter()
+        queries = self.build_queries(company, role)
+        seen_urls: set[str] = set()
+        candidates: list[LinkedInCandidate] = []
+        for query in queries[:5]:
+            if time.perf_counter() - start >= self.max_runtime_seconds:
+                break
+            for result in self._search_google(query)[:5]:
+                url = _extract_clean_linkedin_url(result.get("href", ""))
+                if not url or url in seen_urls:
+                    continue
+                parsed = self._parse_candidate(company, role, result.get("title", ""), result.get("snippet", ""), url)
+                if not parsed:
+                    continue
+                seen_urls.add(url)
+                candidates.append(parsed)
+        return sorted(candidates, key=lambda row: row.score, reverse=True)
+
+    def _search_google(self, query: str) -> list[dict[str, str]]:
+        if query in self._cache:
+            return self._cache[query]
+        time.sleep(random.uniform(1.5, 3.5))
+        try:
+            response = requests.get(
+                GOOGLE_SEARCH_ENDPOINT,
+                params={"q": query, "num": 5, "hl": "en"},
+                timeout=self.timeout_seconds,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            rows: list[dict[str, str]] = []
+            for node in soup.select("div.g"):
+                anchor = node.select_one("a[href]")
+                title_node = node.select_one("h3")
+                snippet_node = node.select_one("div.VwiC3b, span.aCOpRe")
+                if not anchor or not title_node:
+                    continue
+                rows.append(
+                    {
+                        "href": anchor.get("href", ""),
+                        "title": _normalize_whitespace(title_node.get_text(" ", strip=True)),
+                        "snippet": _normalize_whitespace(snippet_node.get_text(" ", strip=True) if snippet_node else ""),
+                    }
+                )
+            self._cache[query] = rows
+            return rows
+        except Exception:
+            self._cache[query] = []
+            return []
+
+    def _parse_candidate(self, company: str, role: str, title_text: str, snippet: str, url: str) -> LinkedInCandidate | None:
+        normalized_title = _normalize_whitespace(title_text)
+        normalized_snippet = _normalize_whitespace(snippet).lower()
+        combined = f"{normalized_title.lower()} {normalized_snippet}"
+        if company.lower() not in combined:
+            return None
+        name = normalized_title.split(" - ", 1)[0].split(" | ", 1)[0].strip() or "Unknown Contact"
+        extracted_title = ""
+        if " - " in normalized_title:
+            parts = [part.strip() for part in normalized_title.split(" - ")]
+            if len(parts) > 1:
+                extracted_title = parts[1]
+        lowered_title = extracted_title.lower() if extracted_title else combined
+        score = self.score_candidate(company=company, role=role, profile_title=lowered_title, snippet=normalized_snippet)
+        return LinkedInCandidate(name=name, title=extracted_title or "unknown", snippet=normalized_snippet, url=url, score=score)
+
+    def score_candidate(self, company: str, role: str, profile_title: str, snippet: str) -> int:
+        profile = f"{profile_title} {snippet}".lower()
+        score = 0
+        if any(token in profile for token in {"recruiter", "talent", "acquisition"}):
+            score += 6
+        if "hiring" in profile:
+            score += 5
+        if "manager" in profile:
+            score += 4
+        role_tokens = {token for token in re.findall(r"[a-zA-Z]+", role.lower()) if len(token) > 2}
+        if role_tokens and any(token in profile for token in role_tokens):
+            score += 4
+            score += 2
+        if company.lower() in profile:
+            score += 3
+        if any(token in profile for token in {"student", "intern", "graduate"}):
+            score -= 3
+        return score

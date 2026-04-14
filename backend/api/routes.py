@@ -12,18 +12,14 @@ from pydantic import BaseModel, Field
 from backend.models.contact import Contact
 from backend.models.internship import Internship
 from backend.services.cv_matching import extract_cv_text, score_internships
-from backend.services.email_enrichment import EmailEnrichmentService
+from backend.services.company_careers_scraper import CompanyCareersScraper
 from backend.services.internsg_scraper import InternSGScraper
 from backend.services.linkedin_search import LinkedInSearchService
 from backend.services.message_generator import MessageGenerator
 from backend.services.outreach_tracker import OutreachTracker
-from backend.services.scoring_engine import ScoringEngine
-from backend.services.strategy_engine import StrategyEngine
 from backend.storage.database import PersistentDatabase
 
 logger = logging.getLogger(__name__)
-TARGET_CONTACTS_PER_COMPANY = 5
-MIN_CONTACTS_PER_COMPANY = 3
 FINAL_MIN_RESULTS = 3
 FINAL_MAX_RESULTS = 5
 
@@ -71,10 +67,8 @@ def build_router() -> APIRouter:
     router = APIRouter(prefix="/api")
     database = PersistentDatabase()
     scraper = InternSGScraper()
+    careers_scraper = CompanyCareersScraper()
     linkedin = LinkedInSearchService()
-    email_service = EmailEnrichmentService()
-    scoring = ScoringEngine()
-    strategy = StrategyEngine()
     message_generator = MessageGenerator()
     tracker = OutreachTracker(database)
     state = AppState(
@@ -89,50 +83,15 @@ def build_router() -> APIRouter:
     def _result_key(company: str, role: str) -> str:
         return f"{company.strip().lower()}||{role.strip().lower()}"
 
-    def _dedupe_contacts(contacts: list[Contact], company: str) -> list[Contact]:
-        unique: dict[tuple[str, str, str], Contact] = {}
-        for contact in contacts:
-            if contact.company.lower() != company.lower():
-                continue
-            unique_key = (contact.name.strip().lower(), contact.company.strip().lower(), contact.role.strip().lower())
-            if unique_key not in unique:
-                unique[unique_key] = contact
-        return list(unique.values())
-
-    def _format_contact_output(
-        contact: Contact,
-        score_row: Any,
-        email_row: Any,
-    ) -> dict[str, Any]:
-        reason = (
-            f"Role match {score_row.role_match:.2f}, affinity {score_row.affinity:.2f}, "
-            f"reachability {score_row.reachability_score:.2f}"
-        )
-        return {
-            "id": contact.id,
-            "name": contact.name,
-            "role": contact.role,
-            "company": contact.company,
-            "linkedin_url": contact.linkedin_url,
-            "email": email_row.email if email_row else None,
-            "email_confidence": email_row.confidence_label if email_row else "NONE",
-            "scores": {
-                "role_match": score_row.role_match,
-                "affinity": score_row.affinity,
-                "reachability": score_row.reachability_score,
-                "final": score_row.final_score,
-            },
-            "reason": reason,
-        }
-
-    def _internship_quality_score(internship: Internship, contact: Contact) -> int:
+    def _internship_quality_score(internship: Internship, contact: Contact, role: str) -> int:
         score = 0
         title = internship.role.lower()
         body = f"{internship.role} {internship.description} {internship.requirements}".lower()
         contact_role = contact.role.lower()
         if "intern" in title:
             score += 5
-        if any(token in body for token in {"machine learning", "ml", "ai", "data science"}):
+        role_tokens = {token for token in role.lower().split() if token}
+        if any(token in body for token in role_tokens):
             score += 5
         if "singapore" in body:
             score += 3
@@ -145,6 +104,30 @@ def build_router() -> APIRouter:
         if "." in contact.linkedin_url:
             score += 2
         return score
+
+    def _strict_job_filter(internship: Internship, target_role: str) -> bool:
+        if "intern" not in internship.role.lower() and "internship" not in internship.role.lower():
+            return False
+        if not internship.company.strip() or len(internship.description.strip()) < 80:
+            return False
+        role_tokens = {token for token in target_role.lower().split() if len(token) > 2}
+        haystack = f"{internship.role} {internship.description} {internship.requirements}".lower()
+        return not role_tokens or any(token in haystack for token in role_tokens)
+
+    def _format_job_output(internship: Internship, contact: Contact, quality_score: int) -> dict[str, Any]:
+        return {
+            "title": internship.role,
+            "company": internship.company,
+            "location": internship.location or ("Singapore" if "singapore" in internship.description.lower() else ""),
+            "description": internship.description,
+            "job_url": internship.job_url,
+            "linkedin_contact": {
+                "name": contact.name,
+                "role": contact.role,
+                "linkedin_url": contact.linkedin_url,
+            },
+            "quality_score": quality_score,
+        }
 
     @router.post("/pipeline/run")
     async def run_pipeline(
@@ -179,87 +162,82 @@ def build_router() -> APIRouter:
             logger.info("InternSG scrape duration=%.2fs", time.perf_counter() - scrape_start)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        ranked_internships = score_internships(cv_text, internships)[:20]
-        logger.info("Pipeline internships ranked: count=%s", len(ranked_internships))
-        for internship in ranked_internships:
+        ranked_stage1 = score_internships(cv_text, internships)[:25]
+        logger.info("Pipeline internships ranked: count=%s", len(ranked_stage1))
+        for internship in ranked_stage1:
             state.internships[internship.id] = internship
             database.upsert_internship(internship.model_dump(exclude={"role_match"}))
 
-        company_best_email: dict[str, str | None] = {}
-        for internship in ranked_internships:
-            if internship.company not in company_best_email and internship.application_email:
-                company_best_email[internship.company] = internship.application_email
+        def qualify_jobs(rows: list[Internship]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+            qualified: list[dict[str, Any]] = []
+            debug_rows: list[dict[str, Any]] = []
+            linkedin_candidates = 0
+            for internship in rows:
+                if not _strict_job_filter(internship, target_role):
+                    continue
+                contact, debug_row = linkedin.discover_job_contact(internship.company, internship.role or target_role)
+                linkedin_candidates += int(debug_row.get("candidates_found", 0))
+                debug_rows.append(debug_row)
+                if not contact:
+                    continue
+                quality_score = _internship_quality_score(internship, contact, target_role)
+                qualified.append(_format_job_output(internship, contact, quality_score))
+            return qualified, debug_rows, linkedin_candidates
 
-        contacts_out: list[dict[str, Any]] = []
-        qualified_jobs: list[dict[str, Any]] = []
-        linkedin_matches = 0
+        qualified_stage1, per_job_debug, linkedin_candidates = qualify_jobs(ranked_stage1)
 
-        for internship in ranked_internships:
-            company = internship.company
-            internship_role = internship.role or target_role
-            if not company.strip():
-                continue
-
-            body = f"{internship.role} {internship.description} {internship.requirements}".lower()
-            if "intern" not in internship.role.lower():
-                continue
-            if len(internship.description.strip()) < 60:
-                continue
-            if not any(token in body for token in {"machine learning", "ml", "ai", "data science"}):
-                continue
-
-            discovered = linkedin.discover_contacts(company, internship_role, limit=TARGET_CONTACTS_PER_COMPANY)
-            deduped_contacts = _dedupe_contacts(discovered, company)[:TARGET_CONTACTS_PER_COMPANY]
-            if not deduped_contacts:
-                continue
-
-            linkedin_matches += len(deduped_contacts)
-            best_contact = deduped_contacts[0]
-            quality_score = _internship_quality_score(internship, best_contact)
-            qualified_jobs.append(
-                {
-                    "title": internship.role,
-                    "company": internship.company,
-                    "location": "Singapore" if "singapore" in body else "Unknown",
-                    "description": internship.description,
-                    "linkedin_contact": {
-                        "name": best_contact.name,
-                        "role": best_contact.role,
-                        "linkedin_url": best_contact.linkedin_url,
-                    },
-                    "quality_score": quality_score,
-                }
-            )
-
-        final_jobs = sorted(qualified_jobs, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
-        if len(final_jobs) >= FINAL_MIN_RESULTS:
-            final_jobs = final_jobs[:FINAL_MAX_RESULTS]
+        if len(qualified_stage1) >= FINAL_MIN_RESULTS:
+            final_jobs = sorted(qualified_stage1, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
+        else:
+            stage2_rows = careers_scraper.scrape(target_role, limit=20)
+            stage2_internships = [
+                Internship(
+                    id=f"career-{idx}",
+                    company=row.company,
+                    role=row.title,
+                    location=row.location,
+                    description=row.description,
+                    requirements=row.description,
+                    job_url=row.job_url,
+                    source="CareerPage",
+                )
+                for idx, row in enumerate(stage2_rows, start=1)
+            ]
+            qualified_stage2, debug_stage2, linkedin_candidates_stage2 = qualify_jobs(stage2_internships)
+            per_job_debug.extend(debug_stage2)
+            linkedin_candidates += linkedin_candidates_stage2
+            merged = qualified_stage1 + qualified_stage2
+            final_jobs = sorted(merged, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
 
         logger.info(
             "Pipeline strict metrics: %s",
             {
                 "expanded_queries": scraper.expand_query(target_role),
-                "raw_results": len(internships),
-                "after_filtering": len(qualified_jobs),
-                "linkedin_found": linkedin_matches,
+                "raw_results": len(ranked_stage1),
+                "filtered_jobs": len(qualified_stage1),
+                "linkedin_profiles_found": linkedin_candidates,
+                "qualified_profiles": sum(1 for row in per_job_debug if row.get("selected_profile_name")),
                 "final_count": len(final_jobs),
             },
         )
+        for row in per_job_debug:
+            logger.info("Per-job debug: %s", row)
 
         return {
             "user": state.users[user_id].model_dump(),
             "cv_text": cv_text,
             "internships": final_jobs,
-            "contacts": contacts_out,
+            "contacts": [],
             "reason": (
                 None
                 if final_jobs
-                else "No high-quality internships found with identifiable LinkedIn contacts"
+                else "No internships met high-confidence LinkedIn contact requirement"
             ),
             "debug": {
-                "raw_count": len(internships),
-                "filtered_count": len(qualified_jobs),
-                "linkedin_matches": linkedin_matches,
+                "raw_jobs": len(ranked_stage1),
+                "filtered_jobs": len(qualified_stage1),
+                "linkedin_candidates": linkedin_candidates,
+                "qualified_contacts": sum(1 for row in per_job_debug if row.get("selected_profile_name")),
             },
         }
 

@@ -6,3 +6,4 @@ beautifulsoup4
 pypdf
 python-multipart
 python-dotenv
+pytest

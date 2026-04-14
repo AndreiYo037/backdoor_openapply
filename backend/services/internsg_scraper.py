@@ -38,8 +38,10 @@ class TinyFishEvent:
 class RawInternshipRow:
     title: str
     company: str
+    location: str
     description: str
     requirements: str
+    job_url: str
     application_email: str | None
 
 
@@ -69,8 +71,10 @@ class InternSGScraper:
                     id=f"internsg-{len(internships) + 1}",
                     company=row.company,
                     role=row.title,
+                    location=row.location,
                     description=row.description,
                     requirements=row.requirements,
+                    job_url=row.job_url,
                     application_email=row.application_email,
                     source="InternSG",
                 )
@@ -108,6 +112,8 @@ class InternSGScraper:
             f"{role} internship singapore",
             f"{role} intern",
             f"{role} internship",
+            f"{role} intern asia",
+            f"{role} internship asia",
         ]
 
     def _fetch_rows_parallel(self, queries: list[str], limit: int) -> dict[str, list[RawInternshipRow]]:
@@ -209,8 +215,10 @@ class InternSGScraper:
                 RawInternshipRow(
                     title=title,
                     company=company,
+                    location="Singapore" if "singapore" in text.lower() else "",
                     description=text[:500],
                     requirements=text[:500],
+                    job_url=self._extract_job_url_from_card(card),
                     application_email=email_match.group(0) if email_match else None,
                 )
             )
@@ -247,8 +255,10 @@ class InternSGScraper:
                 RawInternshipRow(
                     title=role,
                     company=company,
+                    location="Singapore" if "singapore" in description.lower() else "",
                     description=description[:500],
                     requirements=description[:500],
+                    job_url=self._as_string(post.get("link")),
                     application_email=email_match.group(0) if email_match else None,
                 )
             )
@@ -302,8 +312,10 @@ class InternSGScraper:
         return RawInternshipRow(
             title=title,
             company=company,
+            location=self._as_string(record.get("location")),
             description=description,
             requirements=requirements,
+            job_url=self._as_string(record.get("job_url") or record.get("url") or record.get("link")),
             application_email=email_match.group(0) if email_match else None,
         )
 
@@ -463,4 +475,15 @@ class InternSGScraper:
         parts = [part.strip() for part in re.split(r"[-|•]", fallback_text) if part.strip()]
         if len(parts) > 1:
             return self._as_string(parts[1][:120])
+        return ""
+
+    def _extract_job_url_from_card(self, card: Any) -> str:
+        anchor = card.select_one("a[href]")
+        if not anchor:
+            return ""
+        href = self._as_string(anchor.get("href"))
+        if href.startswith("http://") or href.startswith("https://"):
+            return href
+        if href.startswith("/"):
+            return f"https://www.internsg.com{href}"
         return ""
