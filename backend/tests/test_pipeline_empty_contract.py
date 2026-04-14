@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from backend.api import routes
 from backend.models.internship import Internship
@@ -9,8 +10,8 @@ def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkey
     monkeypatch.setattr(routes, "extract_cv_text", lambda _bytes: "machine learning")
     monkeypatch.setattr(routes, "score_internships", lambda _cv, jobs: jobs)
 
-    def fake_scrape(self, role_query: str, limit: int = 25):  # noqa: ANN001
-        return [
+    def fake_scrape_from_search_url(self, search_url: str, role_query: str, limit: int = 25, max_pages: int = 3):  # noqa: ANN001
+        jobs = [
             Internship(
                 id="intern-1",
                 company="Grab",
@@ -22,8 +23,10 @@ def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkey
                 source="InternSG",
             )
         ]
+        meta = SimpleNamespace(input_url=search_url, total_pages_fetched=1, raw_jobs=1, filtered_jobs=1)
+        return jobs, meta
 
-    monkeypatch.setattr(routes.InternSGScraper, "scrape", fake_scrape)
+    monkeypatch.setattr(routes.InternSGScraper, "scrape_from_search_url", fake_scrape_from_search_url)
     monkeypatch.setattr(
         routes.LinkedInSearchService,
         "discover_job_contact",
@@ -32,7 +35,6 @@ def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkey
             {"company": company, "candidates_found": 0, "top_score": 0, "selected_profile_name": None},
         ),
     )
-    monkeypatch.setattr(routes.CompanyCareersScraper, "scrape", lambda self, role_query, limit=10: [])
 
     app = FastAPI()
     app.include_router(routes.build_router())
@@ -48,4 +50,4 @@ def test_pipeline_returns_strict_empty_contract_when_no_contact_qualifies(monkey
     assert set(("success", "data", "error")).issubset(body.keys())
     assert body["internships"] == []
     assert body["reason"] == "No internships met high-confidence LinkedIn contact requirement"
-    assert set(body["debug"].keys()) == {"raw_jobs", "filtered_jobs", "linkedin_candidates", "qualified_contacts"}
+    assert set(body["debug"].keys()) == {"raw_jobs", "after_filtering", "linkedin_candidates", "qualified_contacts"}

@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 
 from backend.models.contact import Contact
 from backend.models.internship import Internship
-from backend.services.company_careers_scraper import CompanyCareersScraper
 from backend.services.cv_matching import extract_cv_text, score_internships
 from backend.services.internsg_scraper import InternSGScraper
 from backend.services.linkedin_search import LinkedInSearchService
@@ -23,8 +22,7 @@ logger = logging.getLogger(__name__)
 FINAL_MIN_RESULTS = 3
 FINAL_MAX_RESULTS = 5
 PIPELINE_MAX_SECONDS = 45
-MAX_STAGE1_LINKEDIN_JOBS = 3
-STAGE2_TRIGGER_MAX_STAGE1_QUALIFIED = 0
+MAX_LINKEDIN_JOBS = 5
 
 
 class UserRecord(BaseModel):
@@ -70,7 +68,6 @@ def build_router() -> APIRouter:
     router = APIRouter(prefix="/api")
     database = PersistentDatabase()
     scraper = InternSGScraper()
-    careers_scraper = CompanyCareersScraper()
     linkedin = LinkedInSearchService()
     message_generator = MessageGenerator()
     tracker = OutreachTracker(database)
@@ -143,6 +140,7 @@ def build_router() -> APIRouter:
     @router.post("/pipeline/run")
     async def run_pipeline(
         target_role: str = Form(...),
+        internsg_url: str | None = Form(None),
         user_id: str = Form("u1"),
         user_name: str = Form("Student"),
         user_email: str = Form("student@example.com"),
@@ -150,7 +148,7 @@ def build_router() -> APIRouter:
         cv: UploadFile = File(...),
     ) -> dict[str, Any]:
         try:
-            logger.info("[API] PipelineEntry -> Input: user_id=%s role=%s", user_id, target_role)
+            logger.info("[API] PipelineEntry -> Input: user_id=%s role=%s input_url=%s", user_id, target_role, internsg_url)
             pipeline_start = time.perf_counter()
             state.internships.clear()
             state.contacts.clear()
@@ -170,9 +168,17 @@ def build_router() -> APIRouter:
             database.upsert_user(state.users[user_id].model_dump())
 
             scrape_start = time.perf_counter()
-            logger.info("[Service] InternSGScraper -> Input: role=%s", target_role)
-            internships = scraper.scrape(target_role, limit=30)
-            logger.info("[Service] InternSGScraper -> Output: count=%s duration=%.2fs", len(internships), time.perf_counter() - scrape_start)
+            search_url = internsg_url or f"https://www.internsg.com/jobs/?search={target_role.replace(' ', '+')}"
+            logger.info("[Service] InternSGScraper -> Input: role=%s url=%s", target_role, search_url)
+            internships, scrape_meta = scraper.scrape_from_search_url(search_url, role_query=target_role, limit=30, max_pages=3)
+            logger.info(
+                "[Service] InternSGScraper -> Output: count=%s duration=%.2fs pages=%s raw=%s filtered=%s",
+                len(internships),
+                time.perf_counter() - scrape_start,
+                scrape_meta.total_pages_fetched,
+                scrape_meta.raw_jobs,
+                scrape_meta.filtered_jobs,
+            )
             ranked_stage1 = score_internships(cv_text, internships)[:25]
             logger.info("[Service] CVMatching -> Output: ranked_count=%s", len(ranked_stage1))
             for internship in ranked_stage1:
@@ -205,52 +211,24 @@ def build_router() -> APIRouter:
 
             qualified_stage1, per_job_debug, linkedin_candidates = qualify_jobs(
                 ranked_stage1,
-                max_jobs=MAX_STAGE1_LINKEDIN_JOBS,
+                max_jobs=MAX_LINKEDIN_JOBS,
             )
-
-            if len(qualified_stage1) >= FINAL_MIN_RESULTS:
-                final_jobs = sorted(qualified_stage1, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
-            else:
-                should_run_stage2 = (
-                    len(qualified_stage1) <= STAGE2_TRIGGER_MAX_STAGE1_QUALIFIED
-                    and time.perf_counter() - pipeline_start < PIPELINE_MAX_SECONDS - 8
-                )
-                if should_run_stage2:
-                    logger.info("[Service] CompanyCareersScraper -> Input: role=%s", target_role)
-                    stage2_rows = careers_scraper.scrape(target_role, limit=20)
-                    logger.info("[Service] CompanyCareersScraper -> Output: count=%s", len(stage2_rows))
-                    stage2_internships = [
-                        Internship(
-                            id=f"career-{idx}",
-                            company=row.company,
-                            role=row.title,
-                            location=row.location,
-                            description=row.description,
-                            requirements=row.description,
-                            job_url=row.job_url,
-                            source="CareerPage",
-                        )
-                        for idx, row in enumerate(stage2_rows, start=1)
-                    ]
-                    qualified_stage2, debug_stage2, linkedin_candidates_stage2 = qualify_jobs(stage2_internships, max_jobs=2)
-                    per_job_debug.extend(debug_stage2)
-                    linkedin_candidates += linkedin_candidates_stage2
-                    merged = qualified_stage1 + qualified_stage2
-                    final_jobs = sorted(merged, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
-                else:
-                    final_jobs = sorted(qualified_stage1, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
+            final_jobs = sorted(qualified_stage1, key=lambda row: row["quality_score"], reverse=True)[:FINAL_MAX_RESULTS]
 
             logger.info(
                 "[API] PipelineExit -> Output: %s",
                 {
-                    "expanded_queries": scraper.expand_query(target_role),
-                    "raw_results": len(ranked_stage1),
+                    "input_url": search_url,
+                    "total_pages_fetched": scrape_meta.total_pages_fetched,
+                    "raw_jobs": scrape_meta.raw_jobs,
                     "filtered_jobs": len(qualified_stage1),
                     "linkedin_profiles_found": linkedin_candidates,
                     "qualified_profiles": sum(1 for row in per_job_debug if row.get("selected_profile_name")),
                     "final_count": len(final_jobs),
                 },
             )
+            for row in per_job_debug:
+                logger.info("[API] JobDebug -> %s", row)
 
             payload = {
                 "user": state.users[user_id].model_dump(),
@@ -260,8 +238,8 @@ def build_router() -> APIRouter:
                 "contacts": [],
                 "reason": None if final_jobs else "No internships met high-confidence LinkedIn contact requirement",
                 "debug": {
-                    "raw_jobs": len(ranked_stage1),
-                    "filtered_jobs": len(qualified_stage1),
+                    "raw_jobs": scrape_meta.raw_jobs,
+                    "after_filtering": len(qualified_stage1),
                     "linkedin_candidates": linkedin_candidates,
                     "qualified_contacts": sum(1 for row in per_job_debug if row.get("selected_profile_name")),
                 },
@@ -269,9 +247,20 @@ def build_router() -> APIRouter:
             response = _ok(payload)
             response.update(payload)
             return response
-        except RuntimeError as exc:
-            logger.exception("[API] PipelineError -> %s", exc)
-            raise HTTPException(status_code=503, detail=_err(str(exc)))
+        except ValueError as exc:
+            logger.exception("[API] PipelineValidationError -> %s", exc)
+            payload = {
+                "user": state.users.get(user_id).model_dump() if user_id in state.users else None,
+                "cv_text": "",
+                "jobs": [],
+                "internships": [],
+                "contacts": [],
+                "reason": str(exc),
+                "debug": {"raw_jobs": 0, "after_filtering": 0, "linkedin_candidates": 0, "qualified_contacts": 0},
+            }
+            response = _ok(payload)
+            response.update(payload)
+            return response
         except Exception as exc:
             logger.exception("[API] PipelineUnhandledError -> %s", exc)
             raise HTTPException(status_code=500, detail=_err("Internal server error"))

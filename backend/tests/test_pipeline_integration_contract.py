@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from backend.api import routes
 from backend.models.contact import Contact
@@ -10,8 +11,8 @@ def test_pipeline_contract_and_non_empty_data(monkeypatch) -> None:
     monkeypatch.setattr(routes, "extract_cv_text", lambda _bytes: "machine learning")
     monkeypatch.setattr(routes, "score_internships", lambda _cv, jobs: jobs)
 
-    def fake_scrape(self, role_query: str, limit: int = 25):  # noqa: ANN001
-        return [
+    def fake_scrape_from_search_url(self, search_url: str, role_query: str, limit: int = 25, max_pages: int = 3):  # noqa: ANN001
+        jobs = [
             Internship(
                 id="intern-1",
                 company="Grab",
@@ -23,9 +24,10 @@ def test_pipeline_contract_and_non_empty_data(monkeypatch) -> None:
                 source="InternSG",
             )
         ]
+        meta = SimpleNamespace(input_url=search_url, total_pages_fetched=1, raw_jobs=1, filtered_jobs=1)
+        return jobs, meta
 
-    monkeypatch.setattr(routes.InternSGScraper, "scrape", fake_scrape)
-    monkeypatch.setattr(routes.CompanyCareersScraper, "scrape", lambda self, role_query, limit=10: [])
+    monkeypatch.setattr(routes.InternSGScraper, "scrape_from_search_url", fake_scrape_from_search_url)
     monkeypatch.setattr(
         routes.LinkedInSearchService,
         "discover_job_contact",
